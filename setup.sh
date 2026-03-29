@@ -27,7 +27,7 @@ MDNS_ENCRYPTION="2"   # 2=ChaCha20
 SLIP_CERT_DIR="/etc/dnstm/tunnels/slip-socks"
 SLIP_PORT="5310"
 
-DNSTT_PORT="5311"
+DNSTT_PORT="5313"
 DNSTT_KEY_DIR="/opt/dnstt"
 
 SOCKS_PORT="58076"        # private/internal microsocks
@@ -585,7 +585,7 @@ Environment=TOR_PT_ORPORT=127.0.0.1:${dnstt_socks_port}
 ExecStart=/usr/local/bin/dnstt-server-noizdns \\
     -privkey-file ${DNSTT_KEY_DIR}/server.key \\
     -mtu 1232 \\
-    ${DNSTT_DOMAIN}
+    ${DNSTT_DOMAIN}x
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -647,6 +647,14 @@ setup_dnstm() {
       "enabled": true,
       "transport": "forward",
       "domain": "${DNSTT_DOMAIN}",
+      "port": ${DNSTT_PORT},
+      "forward": { "address": "127.0.0.1:${DNSTT_PORT}" }
+    },
+    {
+      "tag": "dnstt-tunnel-nx",
+      "enabled": true,
+      "transport": "forward",
+      "domain": "${DNSTT_DOMAIN}x",
       "port": ${DNSTT_PORT},
       "forward": { "address": "127.0.0.1:${DNSTT_PORT}" }
     }

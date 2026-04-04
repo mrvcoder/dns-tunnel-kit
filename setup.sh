@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  DNS Tunnel Kit — Multi-Tunnel Setup Script
-#  Supports: MasterDnsVPN + Slipstream + dnstt
+#  Supports: MasterDnsVPN + Slipstream + dnstt + VayDNS
 #  Credits : https://github.com/mrvcoder
 # ============================================================
 
@@ -19,6 +19,7 @@ TUNNEL_PASS="${TUNNEL_PASS:-}"
 MDNS_DOMAIN="${MDNS_DOMAIN:-a.example.com}"
 SLIP_DOMAIN="${SLIP_DOMAIN:-b.example.com}"
 DNSTT_DOMAIN="${DNSTT_DOMAIN:-c.example.com}"
+VAYDNS_DOMAIN="${VAYDNS_DOMAIN:-d.example.com}"
 
 MDNS_INSTALL_DIR="/opt/masterdnsvpn"
 MDNS_PORT="5312"
@@ -29,6 +30,9 @@ SLIP_PORT="5310"
 
 DNSTT_PORT="5313"
 DNSTT_KEY_DIR="/opt/dnstt"
+
+VAYDNS_PORT="5314"
+VAYDNS_KEY_DIR="/opt/vaydns"
 
 SOCKS_PORT="58076"        # private/internal microsocks
 SOCKS_SLIP_PORT="58077"   # public/Slipstream microsocks
@@ -128,7 +132,7 @@ draw_banner() {
     cat << 'BANNER'
   ╔══════════════════════════════════════════════════════╗
   ║          DNS TUNNEL KIT  —  Setup & Manager          ║
-  ║   MasterDnsVPN  ·  Slipstream  ·  dnstt              ║
+  ║   MasterDnsVPN  ·  Slipstream  ·  dnstt  ·  VayDNS  ║
   ║   Credits: github.com/mrvcoder                        ║
   ╚══════════════════════════════════════════════════════╝
 BANNER
@@ -218,6 +222,24 @@ install_bundled_binaries() {
         fi
     else
         info "slipstream-server already installed"
+    fi
+
+    # vaydns-server — bundled in bin/ or downloadable
+    if [[ -f "${bin_dir}/vaydns-server" ]]; then
+        install -m 0755 "${bin_dir}/vaydns-server" "/usr/local/bin/vaydns-server"
+        info "Installed: vaydns-server (bundled)"
+    elif ! command -v vaydns-server >/dev/null 2>&1; then
+        info "Downloading vaydns-server..."
+        local vaydns_url="https://github.com/net2share/vaydns/releases/latest/download/vaydns-server-linux-${ARCH}"
+        if curl -fSL -o /tmp/vaydns-server "${vaydns_url}" 2>/dev/null && file /tmp/vaydns-server | grep -q ELF; then
+            install -m 0755 /tmp/vaydns-server /usr/local/bin/vaydns-server
+            rm -f /tmp/vaydns-server
+            info "Installed: vaydns-server"
+        else
+            warn "Failed to download vaydns-server — VayDNS setup will be skipped"
+        fi
+    else
+        info "vaydns-server already installed"
     fi
 
     # NoizDNS dnstt-server (supports both dnstt + NoizDNS clients)
@@ -604,6 +626,69 @@ UNIT
 }
 
 # ════════════════════════════════════════════════════════════
+#  VAYDNS
+# ════════════════════════════════════════════════════════════
+
+setup_vaydns() {
+    section "Setting up VayDNS (${VAYDNS_DOMAIN})"
+
+    if ! command -v vaydns-server >/dev/null 2>&1; then
+        warn "vaydns-server not found — skipping VayDNS setup"
+        return 0
+    fi
+    require microsocks
+
+    mkdir -p "$VAYDNS_KEY_DIR"
+
+    # Generate keypair if not present
+    if [[ ! -f "${VAYDNS_KEY_DIR}/server.key" ]]; then
+        info "Generating VayDNS keypair..."
+        /usr/local/bin/vaydns-server -gen-key \
+            -privkey-file "${VAYDNS_KEY_DIR}/server.key" \
+            -pubkey-file  "${VAYDNS_KEY_DIR}/server.pub"
+        chmod 600 "${VAYDNS_KEY_DIR}/server.key"
+        info "Keypair saved → ${VAYDNS_KEY_DIR}/"
+    else
+        info "Reusing existing VayDNS keypair."
+    fi
+
+    local pubkey; pubkey=$(cat "${VAYDNS_KEY_DIR}/server.pub")
+
+    # VayDNS always uses the auth microsocks backend (same as Slipstream).
+    # If no-auth mode is active, use the noauth backend.
+    local vaydns_upstream_port="${SOCKS_SLIP_PORT}"
+    [[ -z "${SOCKS_USER:-}" ]] && vaydns_upstream_port="${SOCKS_NOAUTH_PORT}"
+
+    cat > /etc/systemd/system/vaydns-server.service << UNIT
+[Unit]
+Description=VayDNS Server (${VAYDNS_DOMAIN})
+After=network-online.target microsocks.service microsocks-noauth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vaydns-server \\
+    -udp 127.0.0.1:${VAYDNS_PORT} \\
+    -privkey-file ${VAYDNS_KEY_DIR}/server.key \\
+    -domain ${VAYDNS_DOMAIN} \\
+    -upstream 127.0.0.1:${vaydns_upstream_port}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now vaydns-server
+    sleep 2
+    systemctl is-active --quiet vaydns-server \
+        && info "VayDNS ✓ running  pubkey: ${pubkey}" \
+        || warn "Check logs: journalctl -u vaydns-server -n 30"
+}
+
+# ════════════════════════════════════════════════════════════
 #  DNSTM ROUTER
 # ════════════════════════════════════════════════════════════
 
@@ -657,6 +742,14 @@ setup_dnstm() {
       "domain": "${DNSTT_DOMAIN}x",
       "port": ${DNSTT_PORT},
       "forward": { "address": "127.0.0.1:${DNSTT_PORT}" }
+    },
+    {
+      "tag": "vaydns-tunnel",
+      "enabled": true,
+      "transport": "forward",
+      "domain": "${VAYDNS_DOMAIN}",
+      "port": ${VAYDNS_PORT},
+      "forward": { "address": "127.0.0.1:${VAYDNS_PORT}" }
     }
   ],
   "route": { "mode": "multi", "active": "slip-socks", "default": "slip-socks" }
@@ -765,6 +858,7 @@ show_status() {
         "microsocks:   microsocks auth    :${SOCKS_PORT} (private/internal)"
         "dnstm-dnstt:🟡 dnstt              :${DNSTT_PORT} (${DNSTT_DOMAIN})"
         "microsocks-noauth:   microsocks no-auth :${SOCKS_NOAUTH_PORT} (dnstt backend)"
+        "vaydns-server:🔴 VayDNS            :${VAYDNS_PORT} (${VAYDNS_DOMAIN})"
         "dnstm-dnsrouter:⚙️  dnstm router       :53"
     )
 
@@ -805,6 +899,9 @@ print_client_configs() {
     local dnstt_pub
     dnstt_pub=$(cat "${DNSTT_KEY_DIR}/server.pub" 2>/dev/null \
         || echo "run: cat ${DNSTT_KEY_DIR}/server.pub")
+    local vaydns_pub
+    vaydns_pub=$(cat "${VAYDNS_KEY_DIR}/server.pub" 2>/dev/null \
+        || echo "run: cat ${VAYDNS_KEY_DIR}/server.pub")
 
     local cred_note
     if [[ -n "${TUNNEL_USER}" ]]; then
@@ -861,6 +958,27 @@ print_client_configs() {
     echo "    ./dnstt-client -udp 8.8.8.8:53 \\"
     echo "      -pubkey ${dnstt_pub} \\"
     echo "      ${DNSTT_DOMAIN} 127.0.0.1:1080"
+
+    hr
+    echo -e "\n  ${C_RED}${C_BOLD}🔴 VayDNS${C_RESET}  ${C_DIM}${VAYDNS_DOMAIN}${C_RESET}"
+    echo "  Clients: SlipNet Android app (VayDNS profile), vaydns-client CLI"
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────"
+    echo "  │ DNS server : ${SERVER_IP}:53"
+    echo "  │ Domain     : ${VAYDNS_DOMAIN}"
+    echo "  │ Public key : ${vaydns_pub}"
+    echo "  └─────────────────────────────────────────────────"
+    echo "  CLI client:"
+    echo "    ./vaydns-client -udp ${SERVER_IP}:53 \\"
+    echo "      -pubkey ${vaydns_pub} \\"
+    echo "      -domain ${VAYDNS_DOMAIN} \\"
+    echo "      -listen 127.0.0.1:1080"
+    echo "  Then: curl -x socks5://127.0.0.1:1080 https://ifconfig.me"
+    echo ""
+    echo "  SlipNet profile:"
+    echo "    Type   : VAYDNS"
+    echo "    Domain : ${VAYDNS_DOMAIN}"
+    echo "    Pubkey : ${vaydns_pub}"
     hr
     echo ""
 }
@@ -879,6 +997,8 @@ server=/${SLIP_DOMAIN}/8.8.8.8
 server=/${SLIP_DOMAIN}/1.1.1.1
 server=/${DNSTT_DOMAIN}/8.8.8.8
 server=/${DNSTT_DOMAIN}/1.1.1.1
+server=/${VAYDNS_DOMAIN}/8.8.8.8
+server=/${VAYDNS_DOMAIN}/1.1.1.1
 DNSCONF
     systemctl restart dnsmasq
     info "dnsmasq configured. Point client DNS to this VPS IP."
@@ -902,8 +1022,9 @@ wizard_collect_inputs() {
     ask_yn "Install MasterDnsVPN  (a.domain)" "y" && INSTALL_MDNS=1 || INSTALL_MDNS=0
     ask_yn "Install Slipstream    (b.domain)" "y" && INSTALL_SLIP=1 || INSTALL_SLIP=0
     ask_yn "Install dnstt         (c.domain)" "y" && INSTALL_DNSTT=1 || INSTALL_DNSTT=0
+    ask_yn "Install VayDNS        (d.domain)" "y" && INSTALL_VAYDNS=1 || INSTALL_VAYDNS=0
 
-    if (( INSTALL_MDNS + INSTALL_SLIP + INSTALL_DNSTT == 0 )); then
+    if (( INSTALL_MDNS + INSTALL_SLIP + INSTALL_DNSTT + INSTALL_VAYDNS == 0 )); then
         warn "No tunnels selected. Exiting."
         exit 0
     fi
@@ -915,9 +1036,10 @@ wizard_collect_inputs() {
     echo -e "  ${C_BOLD}── Domains ────────────────────────────────────────${C_RESET}"
     echo -e "  ${C_DIM}NS delegation must point these subdomains to ${SERVER_IP}${C_RESET}"
     echo ""
-    [[ $INSTALL_MDNS  == 1 ]] && ask MDNS_DOMAIN  "MasterDnsVPN domain" "${MDNS_DOMAIN}"
-    [[ $INSTALL_SLIP  == 1 ]] && ask SLIP_DOMAIN  "Slipstream domain  " "${SLIP_DOMAIN}"
-    [[ $INSTALL_DNSTT == 1 ]] && ask DNSTT_DOMAIN "dnstt domain       " "${DNSTT_DOMAIN}"
+    [[ $INSTALL_MDNS   == 1 ]] && ask MDNS_DOMAIN   "MasterDnsVPN domain" "${MDNS_DOMAIN}"
+    [[ $INSTALL_SLIP   == 1 ]] && ask SLIP_DOMAIN   "Slipstream domain  " "${SLIP_DOMAIN}"
+    [[ $INSTALL_DNSTT  == 1 ]] && ask DNSTT_DOMAIN  "dnstt domain       " "${DNSTT_DOMAIN}"
+    [[ $INSTALL_VAYDNS == 1 ]] && ask VAYDNS_DOMAIN "VayDNS domain      " "${VAYDNS_DOMAIN}"
 
     # ── Credentials ───────────────────────────────────────
     echo ""
@@ -943,9 +1065,10 @@ wizard_collect_inputs() {
     hr
     echo -e "\n  ${C_BOLD}${C_WHITE}Configuration Summary${C_RESET}\n"
     printf "  %-22s  %s\n" "Server IP:"   "${SERVER_IP}"
-    [[ $INSTALL_MDNS  == 1 ]] && printf "  %-22s  %s\n" "MasterDnsVPN:" "${MDNS_DOMAIN}"
-    [[ $INSTALL_SLIP  == 1 ]] && printf "  %-22s  %s\n" "Slipstream:"   "${SLIP_DOMAIN}"
-    [[ $INSTALL_DNSTT == 1 ]] && printf "  %-22s  %s\n" "dnstt:"        "${DNSTT_DOMAIN}"
+    [[ $INSTALL_MDNS   == 1 ]] && printf "  %-22s  %s\n" "MasterDnsVPN:" "${MDNS_DOMAIN}"
+    [[ $INSTALL_SLIP   == 1 ]] && printf "  %-22s  %s\n" "Slipstream:"   "${SLIP_DOMAIN}"
+    [[ $INSTALL_DNSTT  == 1 ]] && printf "  %-22s  %s\n" "dnstt:"        "${DNSTT_DOMAIN}"
+    [[ $INSTALL_VAYDNS == 1 ]] && printf "  %-22s  %s\n" "VayDNS:"       "${VAYDNS_DOMAIN}"
     if [[ -n "$TUNNEL_USER" ]]; then
         printf "  %-22s  %s\n" "Auth:" "user=${TUNNEL_USER}  pass=****"
     else
@@ -965,9 +1088,10 @@ wizard_run_install() {
     install_deps
     install_bundled_binaries
 
-    [[ $INSTALL_MDNS  == 1 ]] && setup_masterdnsvpn
-    [[ $INSTALL_SLIP  == 1 ]] && setup_slipstream
-    [[ $INSTALL_DNSTT == 1 ]] && setup_dnstt
+    [[ $INSTALL_MDNS   == 1 ]] && setup_masterdnsvpn
+    [[ $INSTALL_SLIP   == 1 ]] && setup_slipstream
+    [[ $INSTALL_DNSTT  == 1 ]] && setup_dnstt
+    [[ $INSTALL_VAYDNS == 1 ]] && setup_vaydns
 
     # Always set up dnstm router
     setup_dnstm
@@ -991,6 +1115,7 @@ service_control_menu() {
         "microsocks"
         "dnstm-dnstt"
         "microsocks-noauth"
+        "vaydns-server"
         "dnstm-dnsrouter"
     )
 
@@ -1092,13 +1217,14 @@ main_menu() {
         draw_banner
 
         # Quick status bar
-        local mdns_st slip_st dnstt_st router_st
+        local mdns_st slip_st dnstt_st vaydns_st router_st
         systemctl is-active --quiet masterdnsvpn    2>/dev/null && mdns_st="${C_GREEN}●${C_RESET}" || mdns_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet dnstm-slip-socks 2>/dev/null && slip_st="${C_GREEN}●${C_RESET}" || slip_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet dnstm-dnstt      2>/dev/null && dnstt_st="${C_GREEN}●${C_RESET}" || dnstt_st="${C_RED}○${C_RESET}"
+        systemctl is-active --quiet vaydns-server    2>/dev/null && vaydns_st="${C_GREEN}●${C_RESET}" || vaydns_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet dnstm-dnsrouter  2>/dev/null && router_st="${C_GREEN}●${C_RESET}" || router_st="${C_RED}○${C_RESET}"
 
-        echo -e "  ${C_DIM}Tunnels: ${mdns_st} MasterDnsVPN  ${slip_st} Slipstream  ${dnstt_st} dnstt  ${router_st} Router${C_RESET}"
+        echo -e "  ${C_DIM}Tunnels: ${mdns_st} MasterDnsVPN  ${slip_st} Slipstream  ${dnstt_st} dnstt  ${vaydns_st} VayDNS  ${router_st} Router${C_RESET}"
         echo ""
         hr
         echo ""
@@ -1110,12 +1236,13 @@ main_menu() {
         printf "  ${C_YELLOW}%2d)${C_RESET} %s\n"  6  "Install MasterDnsVPN only"
         printf "  ${C_YELLOW}%2d)${C_RESET} %s\n"  7  "Install Slipstream only"
         printf "  ${C_YELLOW}%2d)${C_RESET} %s\n"  8  "Install dnstt only"
-        printf "  ${C_YELLOW}%2d)${C_RESET} %s\n"  9  "Set up middle-proxy  (Iranian VPS)"
+        printf "  ${C_YELLOW}%2d)${C_RESET} %s\n"  9  "Install VayDNS only"
+        printf "  ${C_YELLOW}%2d)${C_RESET} %s\n" 10  "Set up middle-proxy  (Iranian VPS)"
         printf "  ${C_DIM}%3s) %s${C_RESET}\n"    "q" "Quit"
         echo ""
         hr
         echo ""
-        echo -en "  ${C_WHITE}Choose [1-9 / q]:${C_RESET} "
+        echo -en "  ${C_WHITE}Choose [1-10 / q]:${C_RESET} "
         local choice; read -r choice
 
         case "$choice" in
@@ -1181,9 +1308,24 @@ main_menu() {
             9)
                 draw_banner
                 echo ""
-                ask MDNS_DOMAIN  "MasterDnsVPN domain" "${MDNS_DOMAIN}"
-                ask SLIP_DOMAIN  "Slipstream domain"   "${SLIP_DOMAIN}"
-                ask DNSTT_DOMAIN "dnstt domain"        "${DNSTT_DOMAIN}"
+                ask VAYDNS_DOMAIN "VayDNS domain" "${VAYDNS_DOMAIN}"
+                ask TUNNEL_USER   "SOCKS5 username (empty=no-auth)" ""
+                [[ -n "$TUNNEL_USER" ]] && ask_pass TUNNEL_PASS "SOCKS5 password"
+                SOCKS_USER="${TUNNEL_USER:-}"
+                SOCKS_PASS="${TUNNEL_PASS:-}"
+                install_deps
+                install_bundled_binaries
+                setup_vaydns
+                print_client_configs
+                press_enter
+                ;;
+            10)
+                draw_banner
+                echo ""
+                ask MDNS_DOMAIN   "MasterDnsVPN domain" "${MDNS_DOMAIN}"
+                ask SLIP_DOMAIN   "Slipstream domain"   "${SLIP_DOMAIN}"
+                ask DNSTT_DOMAIN  "dnstt domain"        "${DNSTT_DOMAIN}"
+                ask VAYDNS_DOMAIN "VayDNS domain"       "${VAYDNS_DOMAIN}"
                 setup_middle_proxy
                 press_enter
                 ;;
@@ -1211,6 +1353,7 @@ case "$MODE" in
     masterdnsvpn)        install_deps; setup_masterdnsvpn; print_client_configs ;;
     slipstream)          install_deps; install_bundled_binaries; setup_slipstream ;;
     dnstt)               install_deps; install_bundled_binaries; setup_dnstt; print_client_configs ;;
+    vaydns)              install_deps; install_bundled_binaries; setup_vaydns; print_client_configs ;;
     dnstm)               install_deps; install_bundled_binaries; setup_dnstm ;;
     status)              show_status ;;
     client-config)       print_client_configs ;;
@@ -1228,6 +1371,7 @@ case "$MODE" in
         printf "    %-18s  %s\n" "masterdnsvpn"   "Install MasterDnsVPN only"
         printf "    %-18s  %s\n" "slipstream"     "Install Slipstream only"
         printf "    %-18s  %s\n" "dnstt"          "Install dnstt only"
+        printf "    %-18s  %s\n" "vaydns"         "Install VayDNS only"
         printf "    %-18s  %s\n" "status"         "Show service status"
         printf "    %-18s  %s\n" "client-config"  "Print all client configs"
         printf "    %-18s  %s\n" "middle-proxy"   "Iranian VPS DNS multiplexer"

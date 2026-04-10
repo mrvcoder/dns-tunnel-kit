@@ -319,7 +319,13 @@ for a in d.get('assets',[]):
     mv "$bin" "${MDNS_INSTALL_DIR}/MasterDnsVPN_Server"
     chmod +x "${MDNS_INSTALL_DIR}/MasterDnsVPN_Server"
     rm -rf "$tmp"
-    info "MasterDnsVPN installed ($(du -sh "${MDNS_INSTALL_DIR}/MasterDnsVPN_Server" | cut -f1))"
+
+    if file "${MDNS_INSTALL_DIR}/MasterDnsVPN_Server" | grep -q "statically linked"; then
+        info "MasterDnsVPN installed — native Go binary ($(du -sh "${MDNS_INSTALL_DIR}/MasterDnsVPN_Server" | cut -f1))"
+    else
+        warn "MasterDnsVPN binary is dynamically linked (legacy PyInstaller). This may not work with the latest client."
+        warn "Re-run setup or manually replace with the latest release from GitHub."
+    fi
 }
 
 write_masterdnsvpn_config() {
@@ -1084,9 +1090,27 @@ wizard_collect_inputs() {
     fi
 }
 
+cleanup_legacy_services() {
+    local legacy_svcs=(
+        "dnstm"                  # replaced by dnstm-dnsrouter
+        "dnstm-dnstt-socks"      # replaced by dnstm-dnstt
+        "microsocks-slip"        # replaced by microsocks-slip-public
+    )
+    for svc in "${legacy_svcs[@]}"; do
+        if systemctl list-unit-files "${svc}.service" &>/dev/null \
+           && systemctl is-enabled --quiet "${svc}" 2>/dev/null; then
+            warn "Disabling legacy service: ${svc}"
+            systemctl disable --now "${svc}" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}.service"
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 wizard_run_install() {
     install_deps
     install_bundled_binaries
+    cleanup_legacy_services
 
     [[ $INSTALL_MDNS   == 1 ]] && setup_masterdnsvpn
     [[ $INSTALL_SLIP   == 1 ]] && setup_slipstream
@@ -1350,11 +1374,11 @@ MODE="${1:-menu}"
 case "$MODE" in
     menu)                main_menu ;;
     install)             wizard_collect_inputs; wizard_run_install ;;
-    masterdnsvpn)        install_deps; setup_masterdnsvpn; print_client_configs ;;
-    slipstream)          install_deps; install_bundled_binaries; setup_slipstream ;;
-    dnstt)               install_deps; install_bundled_binaries; setup_dnstt; print_client_configs ;;
-    vaydns)              install_deps; install_bundled_binaries; setup_vaydns; print_client_configs ;;
-    dnstm)               install_deps; install_bundled_binaries; setup_dnstm ;;
+    masterdnsvpn)        install_deps; cleanup_legacy_services; setup_masterdnsvpn; print_client_configs ;;
+    slipstream)          install_deps; install_bundled_binaries; cleanup_legacy_services; setup_slipstream ;;
+    dnstt)               install_deps; install_bundled_binaries; cleanup_legacy_services; setup_dnstt; print_client_configs ;;
+    vaydns)              install_deps; install_bundled_binaries; cleanup_legacy_services; setup_vaydns; print_client_configs ;;
+    dnstm)               install_deps; install_bundled_binaries; cleanup_legacy_services; setup_dnstm ;;
     status)              show_status ;;
     client-config)       print_client_configs ;;
     middle-proxy)        setup_middle_proxy ;;

@@ -37,6 +37,7 @@ VAYDNS_KEY_DIR="/opt/vaydns"
 SOCKS_PORT="58076"        # private/internal microsocks
 SOCKS_SLIP_PORT="58077"   # public/Slipstream microsocks
 SOCKS_NOAUTH_PORT="58078" # dnstt no-auth backend
+SSLH_MUX_PORT="59000"     # sslh protocol multiplexer (SSH+SOCKS5)
 
 DNSTM_CONFIG="/etc/dnstm/config.json"
 MDNS_GH_BASE="https://github.com/masterking32/MasterDnsVPN/releases/latest/download"
@@ -152,7 +153,7 @@ press_enter() {
 install_deps() {
     info "Installing dependencies..."
     apt-get update -qq
-    apt-get install -y curl wget unzip python3 openssl 2>/dev/null || true
+    apt-get install -y curl wget unzip python3 openssl sslh 2>/dev/null || true
 }
 
 install_bundled_binaries() {
@@ -578,10 +579,18 @@ setup_dnstt() {
     fi
 
     local pubkey; pubkey=$(cat "${DNSTT_KEY_DIR}/server.pub")
-    local dnstt_socks_port="${SOCKS_NOAUTH_PORT}"
-    local dnstt_after_svc="microsocks-noauth.service"
+    local dnstt_upstream_port
+    local dnstt_after_svc
 
-    info "dnstt always uses no-auth backend on :${SOCKS_NOAUTH_PORT}"
+    if [[ "${INSTALL_SSLH_MUX:-0}" == "1" ]]; then
+        dnstt_upstream_port="${SSLH_MUX_PORT}"
+        dnstt_after_svc="sslh-mux.service"
+        info "dnstt will use sslh multiplexer on :${SSLH_MUX_PORT} (SSH + SOCKS5 auto-detect)"
+    else
+        dnstt_upstream_port="${SOCKS_NOAUTH_PORT}"
+        dnstt_after_svc="microsocks-noauth.service"
+        info "dnstt uses no-auth SOCKS5 backend on :${SOCKS_NOAUTH_PORT}"
+    fi
     cat > /etc/systemd/system/microsocks-noauth.service << UNIT
 [Unit]
 Description=microsocks SOCKS5 no-auth — dnstt backend
@@ -609,7 +618,7 @@ Type=simple
 Environment=TOR_PT_MANAGED_TRANSPORT_VER=1
 Environment=TOR_PT_SERVER_TRANSPORTS=dnstt
 Environment=TOR_PT_SERVER_BINDADDR=dnstt-127.0.0.1:${DNSTT_PORT}
-Environment=TOR_PT_ORPORT=127.0.0.1:${dnstt_socks_port}
+Environment=TOR_PT_ORPORT=127.0.0.1:${dnstt_upstream_port}
 ExecStart=/usr/local/bin/dnstt-server-noizdns \\
     -privkey-file ${DNSTT_KEY_DIR}/server.key \\
     -mtu 1232 \\
@@ -795,6 +804,48 @@ UNIT
 }
 
 # ════════════════════════════════════════════════════════════
+#  SSLH PROTOCOL MULTIPLEXER (SSH + SOCKS5 on one port)
+# ════════════════════════════════════════════════════════════
+
+setup_sslh_mux() {
+    section "Setting up sslh protocol multiplexer"
+    require sslh
+
+    # Disable the default sslh service if present (we use our own unit)
+    systemctl disable --now sslh 2>/dev/null || true
+    systemctl disable --now sslh-fork 2>/dev/null || true
+
+    cat > /etc/systemd/system/sslh-mux.service << UNIT
+[Unit]
+Description=sslh protocol multiplexer (SSH + SOCKS5) for DNS tunnels
+After=network-online.target sshd.service microsocks-noauth.service
+Wants=network-online.target
+Requires=microsocks-noauth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/sslh-select \\
+    --foreground \\
+    --listen 127.0.0.1:${SSLH_MUX_PORT} \\
+    --ssh 127.0.0.1:22 \\
+    --socks5 127.0.0.1:${SOCKS_NOAUTH_PORT} \\
+    --on-timeout=socks5
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now sslh-mux
+    sleep 1
+    systemctl is-active --quiet sslh-mux \
+        && info "sslh-mux ✓ running on :${SSLH_MUX_PORT}  (SSH→:22  SOCKS5→:${SOCKS_NOAUTH_PORT})" \
+        || warn "Check logs: journalctl -u sslh-mux -n 20"
+}
+
+# ════════════════════════════════════════════════════════════
 #  SSH TUNNEL USER
 # ════════════════════════════════════════════════════════════
 
@@ -864,6 +915,7 @@ show_status() {
         "microsocks:   microsocks auth    :${SOCKS_PORT} (private/internal)"
         "dnstm-dnstt:🟡 dnstt              :${DNSTT_PORT} (${DNSTT_DOMAIN})"
         "microsocks-noauth:   microsocks no-auth :${SOCKS_NOAUTH_PORT} (dnstt backend)"
+        "sslh-mux:   sslh multiplexer   :${SSLH_MUX_PORT} (SSH+SOCKS5 auto-detect)"
         "vaydns-server:🔴 VayDNS            :${VAYDNS_PORT} (${VAYDNS_DOMAIN})"
         "dnstm-dnsrouter:⚙️  dnstm router       :53"
     )
@@ -953,13 +1005,35 @@ print_client_configs() {
     hr
     echo -e "\n  ${C_YELLOW}${C_BOLD}🟡 dnstt / NoizDNS${C_RESET}  ${C_DIM}${DNSTT_DOMAIN}${C_RESET}"
     echo "  Clients: dnstt-client, SlipNet (NoizDNS profile)"
-    echo "  ${C_DIM}(No user/pass needed — dnstt backend is no-auth on server side)${C_RESET}"
-    echo ""
-    echo "  ┌─────────────────────────────────────────────────"
-    echo "  │ Domain  : ${DNSTT_DOMAIN}"
-    echo "  │ Pubkey  : ${dnstt_pub}"
-    echo "  │ No client auth required"
-    echo "  └─────────────────────────────────────────────────"
+
+    local sslh_active=false
+    systemctl is-active --quiet sslh-mux 2>/dev/null && sslh_active=true
+
+    if $sslh_active; then
+        echo -e "  ${C_GREEN}Protocol multiplexer active — supports both SOCKS5 and SSH${C_RESET}"
+        echo ""
+        echo "  ┌─────────────────────────────────────────────────"
+        echo "  │ Domain  : ${DNSTT_DOMAIN}"
+        echo "  │ Pubkey  : ${dnstt_pub}"
+        echo "  │"
+        echo "  │ Mode 1: SOCKS5 (no auth)"
+        echo "  │   Connect via dnstt-client → get a SOCKS5 proxy"
+        echo "  │"
+        echo "  │ Mode 2: SSH tunnel"
+        echo "  │   Connect via dnstt-client, then SSH through it:"
+        echo "  │   ssh -o ProxyCommand='nc -x 127.0.0.1:1080 %h %p' \\"
+        echo "  │       -D 8080 tunneluser@${SERVER_IP}"
+        echo "  │   (auto-detected — same tunnel, sslh routes by protocol)"
+        echo "  └─────────────────────────────────────────────────"
+    else
+        echo "  ${C_DIM}(No user/pass needed — dnstt backend is no-auth on server side)${C_RESET}"
+        echo ""
+        echo "  ┌─────────────────────────────────────────────────"
+        echo "  │ Domain  : ${DNSTT_DOMAIN}"
+        echo "  │ Pubkey  : ${dnstt_pub}"
+        echo "  │ No client auth required"
+        echo "  └─────────────────────────────────────────────────"
+    fi
     echo "  Command (dnstt-client):"
     echo "    ./dnstt-client -udp 8.8.8.8:53 \\"
     echo "      -pubkey ${dnstt_pub} \\"
@@ -1037,6 +1111,12 @@ wizard_collect_inputs() {
 
     ask_yn "Set up SSH tunnel user (tunneluser)" "y" && INSTALL_SSH_TUNNEL=1 || INSTALL_SSH_TUNNEL=0
 
+    INSTALL_SSLH_MUX=0
+    if [[ $INSTALL_DNSTT == 1 && $INSTALL_SSH_TUNNEL == 1 ]]; then
+        echo -e "  ${C_DIM}sslh auto-detects SSH vs SOCKS5 on dnstt tunnel — one tunnel, two protocols${C_RESET}"
+        ask_yn "Enable SSH+SOCKS5 multiplexer on dnstt (sslh)" "y" && INSTALL_SSLH_MUX=1 || INSTALL_SSLH_MUX=0
+    fi
+
     # ── Domains ───────────────────────────────────────────
     echo ""
     echo -e "  ${C_BOLD}── Domains ────────────────────────────────────────${C_RESET}"
@@ -1080,6 +1160,8 @@ wizard_collect_inputs() {
     else
         printf "  %-22s  %s\n" "Auth:" "none (open proxy)"
     fi
+    [[ "${INSTALL_SSH_TUNNEL:-0}" == 1 ]] && printf "  %-22s  %s\n" "SSH tunnel user:" "tunneluser"
+    [[ "${INSTALL_SSLH_MUX:-0}" == 1 ]]  && printf "  %-22s  %s\n" "Protocol mux:" "sslh (SSH+SOCKS5 on dnstt)"
     echo ""
     hr
     echo ""
@@ -1114,13 +1196,13 @@ wizard_run_install() {
 
     [[ $INSTALL_MDNS   == 1 ]] && setup_masterdnsvpn
     [[ $INSTALL_SLIP   == 1 ]] && setup_slipstream
+    [[ "${INSTALL_SSH_TUNNEL:-0}" == 1 ]] && setup_ssh_tunnel_user
+    [[ "${INSTALL_SSLH_MUX:-0}" == 1 ]]  && setup_sslh_mux
     [[ $INSTALL_DNSTT  == 1 ]] && setup_dnstt
     [[ $INSTALL_VAYDNS == 1 ]] && setup_vaydns
 
     # Always set up dnstm router
     setup_dnstm
-
-    [[ "${INSTALL_SSH_TUNNEL:-0}" == 1 ]] && setup_ssh_tunnel_user
 
     echo ""
     section "Installation Complete"
@@ -1139,6 +1221,7 @@ service_control_menu() {
         "microsocks"
         "dnstm-dnstt"
         "microsocks-noauth"
+        "sslh-mux"
         "vaydns-server"
         "dnstm-dnsrouter"
     )
@@ -1241,14 +1324,15 @@ main_menu() {
         draw_banner
 
         # Quick status bar
-        local mdns_st slip_st dnstt_st vaydns_st router_st
+        local mdns_st slip_st dnstt_st vaydns_st router_st sslh_st
         systemctl is-active --quiet masterdnsvpn    2>/dev/null && mdns_st="${C_GREEN}●${C_RESET}" || mdns_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet dnstm-slip-socks 2>/dev/null && slip_st="${C_GREEN}●${C_RESET}" || slip_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet dnstm-dnstt      2>/dev/null && dnstt_st="${C_GREEN}●${C_RESET}" || dnstt_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet vaydns-server    2>/dev/null && vaydns_st="${C_GREEN}●${C_RESET}" || vaydns_st="${C_RED}○${C_RESET}"
         systemctl is-active --quiet dnstm-dnsrouter  2>/dev/null && router_st="${C_GREEN}●${C_RESET}" || router_st="${C_RED}○${C_RESET}"
+        systemctl is-active --quiet sslh-mux         2>/dev/null && sslh_st="${C_GREEN}●${C_RESET}" || sslh_st="${C_RED}○${C_RESET}"
 
-        echo -e "  ${C_DIM}Tunnels: ${mdns_st} MasterDnsVPN  ${slip_st} Slipstream  ${dnstt_st} dnstt  ${vaydns_st} VayDNS  ${router_st} Router${C_RESET}"
+        echo -e "  ${C_DIM}Tunnels: ${mdns_st} MasterDnsVPN  ${slip_st} Slipstream  ${dnstt_st} dnstt  ${vaydns_st} VayDNS  ${router_st} Router  ${sslh_st} sslh${C_RESET}"
         echo ""
         hr
         echo ""
@@ -1323,6 +1407,15 @@ main_menu() {
                 [[ -n "$TUNNEL_USER" ]] && ask_pass TUNNEL_PASS "SOCKS5 password"
                 SOCKS_USER="${TUNNEL_USER:-changeme}"
                 SOCKS_PASS="${TUNNEL_PASS:-changeme123}"
+                INSTALL_SSLH_MUX=0
+                echo -e "  ${C_DIM}sslh auto-detects SSH vs SOCKS5 — one tunnel, two protocols${C_RESET}"
+                ask_yn "Enable SSH+SOCKS5 multiplexer (sslh)" "y" && INSTALL_SSLH_MUX=1 || INSTALL_SSLH_MUX=0
+                if [[ $INSTALL_SSLH_MUX == 1 ]]; then
+                    ask_yn "Set up SSH tunnel user (tunneluser)" "y" && {
+                        setup_ssh_tunnel_user
+                    }
+                    setup_sslh_mux
+                fi
                 install_deps
                 install_bundled_binaries
                 setup_dnstt

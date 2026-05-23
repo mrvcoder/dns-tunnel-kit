@@ -1,6 +1,6 @@
 # 🌐 DNS Tunnel Kit
 
-Bypass DNS-based internet censorship using **four independent DNS tunnel methods** — MasterDnsVPN, Slipstream, dnstt, and VayDNS — all managed by a single setup script.
+Bypass DNS-based internet censorship using **five independent DNS tunnel methods** — MasterDnsVPN, Slipstream, dnstt, VayDNS, and StormDNS — all managed by a single setup script.
 
 > **Credits:** [github.com/mrvcoder](https://github.com/mrvcoder)
 
@@ -16,7 +16,8 @@ Bypass DNS-based internet censorship using **four independent DNS tunnel methods
   SlipNet (Slipstream) ───▶ │    ├─ a.yourdomain.com → MasterDnsVPN :5312 │
   dnstt-client         ───▶ │    ├─ b.yourdomain.com → Slipstream   :5310 │
   VayDNS client        ───▶ │    ├─ c.yourdomain.com → dnstt        :5313 │
-                            │    └─ d.yourdomain.com → VayDNS       :5314 │
+  StormDNS client      ───▶ │    ├─ d.yourdomain.com → VayDNS       :5314 │
+                            │    └─ e.yourdomain.com → StormDNS     :5315 │
                             └─────────────────────────────────────────────┘
 ```
 
@@ -26,8 +27,9 @@ Bypass DNS-based internet censorship using **four independent DNS tunnel methods
 | **Slipstream** | `b.yourdomain.com` | DNS → SOCKS5 | TLS passthrough | microsocks |
 | **dnstt** | `c.yourdomain.com` | DNS TXT encoding | Noise protocol | microsocks (no-auth) |
 | **VayDNS** | `d.yourdomain.com` | DNS TXT + KCP + smux | Noise + uTLS | microsocks |
+| **StormDNS** | `e.yourdomain.com` | DNS + ARQ + multi-resolver | ChaCha20 (default) | built-in |
 
-All four run simultaneously on the same server, each on a different subdomain.
+All five run simultaneously on the same server, each on a different subdomain.
 
 ---
 
@@ -48,6 +50,9 @@ All four run simultaneously on the same server, each on a different subdomain.
 > **dnstt-server-noizdns** is not bundled — `setup.sh` downloads it automatically from  
 > [github.com/anonvector/noizdns-deploy/releases](https://github.com/anonvector/noizdns-deploy/releases/latest)
 
+> **StormDNS** is not bundled — `setup.sh` downloads the latest release automatically from  
+> [github.com/nullroute1970/StormDNS/releases](https://github.com/nullroute1970/StormDNS/releases/latest)
+
 ---
 
 ## 🚀 Quick Start
@@ -58,7 +63,7 @@ All four run simultaneously on the same server, each on a different subdomain.
 git clone https://github.com/BarzinJarvis/dns-tunnel-kit
 cd dns-tunnel-kit
 
-# Install everything: MasterDnsVPN + Slipstream + dnstt + VayDNS + dnstm router
+# Install everything: MasterDnsVPN + Slipstream + dnstt + VayDNS + StormDNS + dnstm router
 sudo bash setup.sh install
 ```
 
@@ -69,6 +74,7 @@ sudo bash setup.sh masterdnsvpn   # MasterDnsVPN only
 sudo bash setup.sh slipstream     # Slipstream only
 sudo bash setup.sh dnstt          # dnstt only
 sudo bash setup.sh vaydns         # VayDNS only
+sudo bash setup.sh stormdns       # StormDNS only
 sudo bash setup.sh dnstm          # dnstm DNS router only
 ```
 
@@ -81,6 +87,7 @@ sudo MDNS_DOMAIN=tunnel1.example.com \
      SLIP_DOMAIN=tunnel2.example.com \
      DNSTT_DOMAIN=tunnel3.example.com \
      VAYDNS_DOMAIN=tunnel4.example.com \
+     STORMDNS_DOMAIN=tunnel5.example.com \
      bash setup.sh install
 ```
 
@@ -89,11 +96,12 @@ sudo MDNS_DOMAIN=tunnel1.example.com \
 ## 🛠 All Modes
 
 ```
-setup.sh install         Full setup (all four tunnels + dnstm router)
+setup.sh install         Full setup (all five tunnels + dnstm router)
 setup.sh masterdnsvpn    Install / update MasterDnsVPN only
 setup.sh slipstream      Install Slipstream only
 setup.sh dnstt           Install dnstt only
 setup.sh vaydns          Install VayDNS only
+setup.sh stormdns        Install StormDNS only
 setup.sh dnstm           Install dnstm DNS router only
 setup.sh client-config   Print client configs for all tunnels
 setup.sh status          Show all service status
@@ -213,6 +221,37 @@ Should return your server's IP if the tunnel is working.
 
 ---
 
+### ⚡ StormDNS (`e.yourdomain.com`)
+
+StormDNS is a DNS-over-UDP/53 tunnel tuned for **hostile, lossy networks** — ARQ + multi-resolver load-balancing + MTU discovery + packet packing. Encryption is ChaCha20 (default; XOR/AES-GCM available) with auto-generated server key. In **SOCKS5 mode** (the kit's default) the server picks the destination per client request — no backend microsocks needed.
+
+Compatible clients: StormDNS client CLI ([releases](https://github.com/nullroute1970/StormDNS/releases/latest)), [WhiteDNS Android app](https://github.com/iampedii/WhiteDNS) (StormDNS backend).
+
+1. Get the auto-generated encryption key from the server (created on first run):
+```bash
+cat /opt/stormdns/encrypt_key.txt
+```
+
+2. **CLI client** — edit `client_config.toml`:
+```toml
+DOMAINS = ["e.yourdomain.com"]
+PROTOCOL_TYPE = "SOCKS5"
+DATA_ENCRYPTION_METHOD = 2   # ChaCha20 — match server
+ENCRYPT_KEY = "<key from encrypt_key.txt>"
+SOCKS5_HOST = "127.0.0.1"
+SOCKS5_PORT = 1080
+# RESOLVERS: any open public resolvers, e.g. 1.1.1.1, 8.8.8.8
+```
+
+3. Run the client, then point your app at `socks5://127.0.0.1:1080`. Test:
+```bash
+curl -x socks5://127.0.0.1:1080 https://ifconfig.me
+```
+
+> **Note:** StormDNS treats packet loss, rate limits, and resolver flapping as normal operating conditions — better than dnstt for marginal Iranian links.
+
+---
+
 ## 🔧 Services
 
 | Service | Tunnel | Internal Port |
@@ -224,6 +263,7 @@ Should return your server's IP if the tunnel is working.
 | `dnstm-dnstt.service` | dnstt | UDP 5313 |
 | `microsocks-noauth.service` | dnstt SOCKS5 backend (no-auth) | TCP 58078 |
 | `vaydns-server.service` | VayDNS | UDP 5314 |
+| `stormdns.service` | StormDNS | UDP 5315 |
 | `dnstm-dnsrouter.service` | DNS Router (all tunnels) | UDP 53 |
 
 ---
@@ -244,7 +284,7 @@ For users inside Iran who need a local DNS relay:
 sudo bash setup.sh middle-proxy
 ```
 
-Installs `dnsmasq` rules forwarding all four tunnel domains to public DNS resolvers. Point clients' DNS to this VPS IP.
+Installs `dnsmasq` rules forwarding all five tunnel domains to public DNS resolvers. Point clients' DNS to this VPS IP.
 
 ---
 
@@ -265,20 +305,23 @@ ns1.c.yourdomain.com  A  YOUR_SERVER_IP
 
 d.yourdomain.com  NS  ns1.d.yourdomain.com
 ns1.d.yourdomain.com  A  YOUR_SERVER_IP
+
+e.yourdomain.com  NS  ns1.e.yourdomain.com
+ns1.e.yourdomain.com  A  YOUR_SERVER_IP
 ```
 
 ---
 
 ## 🆚 Tunnel Comparison
 
-| | MasterDnsVPN | Slipstream | dnstt | VayDNS |
-|---|---|---|---|---|
-| **Encryption** | ChaCha20 | TLS | Noise | Noise + uTLS |
-| **Transport** | ARQ/UDP | TCP-over-DNS | KCP+smux | KCP+smux |
-| **DPI resistance** | Medium | Medium | Medium | High (uTLS Chrome fingerprint) |
-| **Speed** | Fast | Medium | Medium | Medium-Fast |
-| **Client** | MasterDnsVPN | SlipNet | dnstt-client / SlipNet | SlipNet / vaydns-client |
-| **SOCKS5 auth** | Optional | Passthrough | No | Optional |
+| | MasterDnsVPN | Slipstream | dnstt | VayDNS | StormDNS |
+|---|---|---|---|---|---|
+| **Encryption** | ChaCha20 | TLS | Noise | Noise + uTLS | ChaCha20 / AES-GCM |
+| **Transport** | ARQ/UDP | TCP-over-DNS | KCP+smux | KCP+smux | ARQ + multi-resolver |
+| **DPI resistance** | Medium | Medium | Medium | High (uTLS Chrome fingerprint) | Medium (plain UDP/53) |
+| **Speed** | Fast | Medium | Medium | Medium-Fast | Tuned for lossy links |
+| **Client** | MasterDnsVPN | SlipNet | dnstt-client / SlipNet | SlipNet / vaydns-client | StormDNS CLI / WhiteDNS |
+| **SOCKS5 auth** | Optional | Passthrough | No | Optional | No (client picks dest) |
 
 ---
 

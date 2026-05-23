@@ -217,7 +217,9 @@ curl -x socks5://127.0.0.1:1080 https://ifconfig.me
 
 Should return your server's IP if the tunnel is working.
 
-> **Note:** VayDNS uses the same authenticated microsocks backend as Slipstream on the server side. The Noise encryption + uTLS fingerprinting makes it resistant to deep packet inspection.
+> **Note:** VayDNS uses the same authenticated microsocks backend as Slipstream on the server side. The Noise encryption + uTLS fingerprinting makes it resistant to deep packet inspection. The server is started with `-dnstt-compat` so SlipNet's DNSTT/NoizDNS clients can connect directly.
+
+> **SlipNet share URI:** `setup.sh client-config` prints a ready-to-paste `slipnet://…` URI for dnstt, NoizDNS, and VayDNS profiles (v24 schema).
 
 ---
 

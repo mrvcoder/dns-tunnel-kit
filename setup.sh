@@ -161,6 +161,96 @@ install_deps() {
     apt-get install -y curl wget unzip python3 openssl sslh 2>/dev/null || true
 }
 
+# ════════════════════════════════════════════════════════════
+#  SLIPNET SHARE-URI GENERATOR  (issue #1, item 6)
+# ════════════════════════════════════════════════════════════
+#
+# Builds a slipnet://<base64> URI per SlipNet's documented v24
+# pipe-delimited schema (anonvector/SlipNet:ConfigExporter.kt).
+# Newer SlipNet versions parse v24 forward-compatibly (additive
+# schema). Supports the tunnel types this kit ships: dnstt, vaydns,
+# and sayedns (NoizDNS-compatible dnstt).
+#
+# Usage:
+#   make_slipnet_uri <mode> <name> <domain> <pubkey>
+#   mode ∈ { dnstt | vaydns | sayedns }
+
+make_slipnet_uri() {
+    local mode="$1" name="$2" domain="$3" pubkey="$4"
+    local resolvers="1.1.1.1:53:0,8.8.8.8:53:0"
+    local vay_compat=0
+    [[ "$mode" == "vaydns" ]] && vay_compat=1
+
+    # 62-field v24 schema (see anonvector/SlipNet:ConfigExporter.kt
+    # buildProfileData). One field per array entry — empty slot = "".
+    local f=(
+        "24"            #  1 VERSION
+        "${mode}"       #  2 tunnelType (dnstt | vaydns | sayedns)
+        "${name}"       #  3 name
+        "${domain}"     #  4 domain
+        "${resolvers}"  #  5 resolvers
+        "0"             #  6 authoritativeMode
+        "60"            #  7 keepAliveInterval
+        "default"       #  8 congestionControl
+        "1080"          #  9 tcpListenPort
+        "127.0.0.1"     # 10 tcpListenHost
+        "0"             # 11 gsoEnabled
+        "${pubkey}"     # 12 dnsttPublicKey
+        ""              # 13 socksUsername
+        ""              # 14 socksPassword
+        "0"             # 15 sshEnabled
+        ""              # 16 sshUsername
+        ""              # 17 sshPassword
+        "22"            # 18 sshPort
+        "0"             # 19 forwardDnsThroughSsh
+        ""              # 20 sshHost
+        "0"             # 21 (was useServerDns)
+        ""              # 22 dohUrl
+        "udp"           # 23 dnsTransport
+        "password"      # 24 sshAuthType
+        ""              # 25 sshPrivateKey (b64)
+        ""              # 26 sshKeyPassphrase (b64)
+        ""              # 27 torBridgeLines (b64)
+        "0"             # 28 dnsttAuthoritative
+        "0"             # 29 naivePort
+        ""              # 30 naiveUsername
+        ""              # 31 naivePassword (b64)
+        "0"             # 32 isLocked
+        ""              # 33 lockPasswordHash
+        "0"             # 34 expirationDate
+        "0"             # 35 allowSharing
+        ""              # 36 boundDeviceId
+        "0"             # 37 resolversHidden
+        ""              # 38 hiddenResolvers
+        "0"             # 39 noizdnsStealth
+        "0"             # 40 dnsPayloadSize
+        "0"             # 41 socks5ServerPort
+        "${vay_compat}" # 42 vaydnsDnsttCompat
+        "txt"           # 43 vaydnsRecordType
+        "0"             # 44 vaydnsMaxQnameLen
+        "0"             # 45 vaydnsRps
+        "10"            # 46 vaydnsIdleTimeout
+        "2"             # 47 vaydnsKeepalive
+        "500"           # 48 vaydnsUdpTimeout
+        "0"             # 49 vaydnsMaxNumLabels
+        "2"             # 50 vaydnsClientIdSize
+        "0"             # 51 sshTlsEnabled
+        ""              # 52 sshTlsSni
+        ""              # 53 sshHttpProxyHost
+        "0"             # 54 sshHttpProxyPort
+        ""              # 55 sshHttpProxyCustomHost
+        "0"             # 56 sshWsEnabled
+        ""              # 57 sshWsPath
+        "0"             # 58 sshWsUseTls
+        ""              # 59 sshWsCustomHost
+        ""              # 60 sshPayload (b64)
+        "reliable"      # 61 resolverMode
+        "3"             # 62 rrSpreadCount
+    )
+    local IFS='|'
+    printf 'slipnet://%s\n' "$(printf '%s' "${f[*]}" | base64 -w0)"
+}
+
 install_bundled_binaries() {
     section "Installing bundled binaries"
     local ARCH; ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
@@ -248,16 +338,28 @@ install_bundled_binaries() {
         info "vaydns-server already installed"
     fi
 
-    # NoizDNS dnstt-server (supports both dnstt + NoizDNS clients)
+    # NoizDNS dnstt-server (supports both dnstt + NoizDNS clients).
+    # The upstream release URL was historically flaky / 404, so we
+    # fall back to the bundled bin/dnstt-server (issue #1).
     if ! command -v dnstt-server-noizdns >/dev/null 2>&1; then
-        info "Downloading dnstt-server-noizdns..."
+        info "Installing dnstt-server-noizdns..."
         local noizdns_url="https://github.com/anonvector/noizdns-deploy/releases/latest/download/dnstt-server-linux-${ARCH}"
-        if curl -fSL -o /tmp/dnstt-server-noizdns "${noizdns_url}" 2>/dev/null; then
+        if curl -fSL -o /tmp/dnstt-server-noizdns "${noizdns_url}" 2>/dev/null \
+                && file /tmp/dnstt-server-noizdns | grep -q ELF; then
             install -m 0755 /tmp/dnstt-server-noizdns /usr/local/bin/dnstt-server-noizdns
             rm -f /tmp/dnstt-server-noizdns
-            info "Installed: dnstt-server-noizdns"
+            info "Installed: dnstt-server-noizdns (upstream)"
         else
-            warn "Failed to download dnstt-server-noizdns"
+            rm -f /tmp/dnstt-server-noizdns
+            if [[ -f "${bin_dir}/dnstt-server" ]]; then
+                install -m 0755 "${bin_dir}/dnstt-server" /usr/local/bin/dnstt-server-noizdns
+                info "Installed: dnstt-server-noizdns (from bundled bin/dnstt-server)"
+            elif command -v dnstt-server >/dev/null 2>&1; then
+                ln -sf "$(command -v dnstt-server)" /usr/local/bin/dnstt-server-noizdns
+                info "Installed: dnstt-server-noizdns (symlink to dnstt-server)"
+            else
+                warn "Failed to install dnstt-server-noizdns"
+            fi
         fi
     else
         info "dnstt-server-noizdns already installed"
@@ -647,6 +749,10 @@ UNIT
     systemctl daemon-reload
     systemctl enable --now microsocks-noauth
 
+    # dnstt-server-noizdns CLI:  -udp ADDR -privkey-file KEY [-mtu N] DOMAIN UPSTREAMADDR
+    # (issue #1 — earlier versions of this unit dropped the -udp flag
+    # and the trailing UPSTREAMADDR, and appended a stray "x" to the
+    # domain.)
     cat > /etc/systemd/system/dnstm-dnstt.service << UNIT
 [Unit]
 Description=dnstt/NoizDNS Tunnel (${DNSTT_DOMAIN})
@@ -654,14 +760,11 @@ After=network-online.target ${dnstt_after_svc}
 
 [Service]
 Type=simple
-Environment=TOR_PT_MANAGED_TRANSPORT_VER=1
-Environment=TOR_PT_SERVER_TRANSPORTS=dnstt
-Environment=TOR_PT_SERVER_BINDADDR=dnstt-127.0.0.1:${DNSTT_PORT}
-Environment=TOR_PT_ORPORT=127.0.0.1:${dnstt_upstream_port}
 ExecStart=/usr/local/bin/dnstt-server-noizdns \\
+    -udp 127.0.0.1:${DNSTT_PORT} \\
     -privkey-file ${DNSTT_KEY_DIR}/server.key \\
     -mtu 1232 \\
-    ${DNSTT_DOMAIN}x
+    ${DNSTT_DOMAIN} 127.0.0.1:${dnstt_upstream_port}
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -713,6 +816,10 @@ setup_vaydns() {
     local vaydns_upstream_port="${SOCKS_SLIP_PORT}"
     [[ -z "${SOCKS_USER:-}" ]] && vaydns_upstream_port="${SOCKS_NOAUTH_PORT}"
 
+    # -dnstt-compat: enables DNSTT wire-format compatibility on the
+    # VayDNS server so SlipNet's DNSTT/NoizDNS clients can connect
+    # without switching profile types (issue #1). The native VayDNS
+    # client still works because the server speaks both formats.
     cat > /etc/systemd/system/vaydns-server.service << UNIT
 [Unit]
 Description=VayDNS Server (${VAYDNS_DOMAIN})
@@ -724,7 +831,8 @@ ExecStart=/usr/local/bin/vaydns-server \\
     -udp 127.0.0.1:${VAYDNS_PORT} \\
     -privkey-file ${VAYDNS_KEY_DIR}/server.key \\
     -domain ${VAYDNS_DOMAIN} \\
-    -upstream 127.0.0.1:${vaydns_upstream_port}
+    -upstream 127.0.0.1:${vaydns_upstream_port} \\
+    -dnstt-compat
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -911,14 +1019,6 @@ setup_dnstm() {
       "enabled": true,
       "transport": "forward",
       "domain": "${DNSTT_DOMAIN}",
-      "port": ${DNSTT_PORT},
-      "forward": { "address": "127.0.0.1:${DNSTT_PORT}" }
-    },
-    {
-      "tag": "dnstt-tunnel-nx",
-      "enabled": true,
-      "transport": "forward",
-      "domain": "${DNSTT_DOMAIN}x",
       "port": ${DNSTT_PORT},
       "forward": { "address": "127.0.0.1:${DNSTT_PORT}" }
     },
@@ -1214,6 +1314,13 @@ print_client_configs() {
     echo "    ./dnstt-client -udp 8.8.8.8:53 \\"
     echo "      -pubkey ${dnstt_pub} \\"
     echo "      ${DNSTT_DOMAIN} 127.0.0.1:1080"
+    if [[ -n "$dnstt_pub" && "$dnstt_pub" != run:* ]]; then
+        echo ""
+        echo "  SlipNet share URI (dnstt):"
+        echo "    $(make_slipnet_uri dnstt "dnstt-${DNSTT_DOMAIN}" "${DNSTT_DOMAIN}" "${dnstt_pub}")"
+        echo "  SlipNet share URI (NoizDNS):"
+        echo "    $(make_slipnet_uri sayedns "noizdns-${DNSTT_DOMAIN}" "${DNSTT_DOMAIN}" "${dnstt_pub}")"
+    fi
 
     hr
     echo -e "\n  ${C_RED}${C_BOLD}🔴 VayDNS${C_RESET}  ${C_DIM}${VAYDNS_DOMAIN}${C_RESET}"
@@ -1235,6 +1342,11 @@ print_client_configs() {
     echo "    Type   : VAYDNS"
     echo "    Domain : ${VAYDNS_DOMAIN}"
     echo "    Pubkey : ${vaydns_pub}"
+    if [[ -n "$vaydns_pub" && "$vaydns_pub" != run:* ]]; then
+        echo ""
+        echo "  SlipNet share URI (VayDNS, dnstt-compat on):"
+        echo "    $(make_slipnet_uri vaydns "vaydns-${VAYDNS_DOMAIN}" "${VAYDNS_DOMAIN}" "${vaydns_pub}")"
+    fi
 
     hr
     echo -e "\n  ${C_WHITE}${C_BOLD}⚡ StormDNS${C_RESET}  ${C_DIM}${STORMDNS_DOMAIN}${C_RESET}"

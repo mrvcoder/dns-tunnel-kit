@@ -91,6 +91,36 @@ sudo MDNS_DOMAIN=tunnel1.example.com \
      bash setup.sh install
 ```
 
+### Cloudflare DNS auto-provisioning
+
+If your tunnel domains are on a Cloudflare-managed zone, the installer can
+create the NS delegations for you. Provide credentials and the wizard will
+ask whether to enable it; the `cloudflare-dns` mode can also be run on its
+own at any time.
+
+```bash
+# Scoped API token (preferred — Zone:DNS:Edit + Zone:Zone:Read on the zone)
+sudo CF_API_TOKEN=cf_xxx bash setup.sh install
+
+# Or the legacy global API key + account email
+sudo CF_EMAIL=you@example.com CF_API_KEY=xxxxxxxx bash setup.sh install
+
+# Provision DNS only (idempotent — safe to re-run)
+sudo CF_API_TOKEN=cf_xxx bash setup.sh cloudflare-dns \
+     a.example.com b.example.com c.example.com
+```
+
+For every tunnel subdomain, the script creates:
+
+```
+<CF_NS_GLUE_LABEL>.<apex>   A   <SERVER_IP>          # one shared NS glue per zone
+<tunnel-subdomain>          NS  <CF_NS_GLUE_LABEL>.<apex>
+```
+
+`CF_NS_GLUE_LABEL` defaults to `dns` (so `dns.example.com`), `CF_RECORD_TTL`
+defaults to `60`. Tunnel domains across multiple Cloudflare zones are handled
+in one pass.
+
 ---
 
 ## 🛠 All Modes
@@ -106,6 +136,7 @@ setup.sh dnstm           Install dnstm DNS router only
 setup.sh client-config   Print client configs for all tunnels
 setup.sh status          Show all service status
 setup.sh middle-proxy    Set up Iranian VPS DNS multiplexer (dnsmasq)
+setup.sh cloudflare-dns  Provision NS delegations on Cloudflare
 ```
 
 ---

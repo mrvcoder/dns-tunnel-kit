@@ -47,6 +47,15 @@ SSLH_MUX_PORT="59000"     # sslh protocol multiplexer (SSH+SOCKS5)
 DNSTM_CONFIG="/etc/dnstm/config.json"
 MDNS_GH_BASE="https://github.com/masterking32/MasterDnsVPN/releases/latest/download"
 
+# Cloudflare DNS auto-provisioning (optional)
+# Either a scoped API token (preferred) OR global API key + email.
+CF_API_TOKEN="${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"
+CF_EMAIL="${CF_EMAIL:-${CLOUDFLARE_EMAIL:-}}"
+CF_API_KEY="${CF_API_KEY:-${CLOUDFLARE_API_KEY:-}}"
+CF_NS_GLUE_LABEL="${CF_NS_GLUE_LABEL:-dns}"   # shared NS host = <label>.<apex>
+CF_RECORD_TTL="${CF_RECORD_TTL:-60}"
+CF_PROVISION=0   # set to 1 by wizard / standalone mode
+
 # Derived after input (set by wizard or env)
 SOCKS_USER="${TUNNEL_USER:-}"
 SOCKS_PASS="${TUNNEL_PASS:-}"
@@ -976,6 +985,148 @@ UNIT
 }
 
 # ════════════════════════════════════════════════════════════
+#  CLOUDFLARE DNS PROVISIONING
+# ════════════════════════════════════════════════════════════
+#
+# Given a list of tunnel subdomains and a server IP, ensures the
+# parent Cloudflare zone has:
+#   <CF_NS_GLUE_LABEL>.<apex>   A   <server_ip>     (shared NS glue)
+#   <subdomain>                 NS  <CF_NS_GLUE_LABEL>.<apex>   (per tunnel)
+# Idempotent: skips records already correct, updates wrong content.
+# Auth: scoped API token (preferred) OR global API key + email.
+
+cf_has_creds() {
+    [[ -n "$CF_API_TOKEN" ]] || { [[ -n "$CF_EMAIL" && -n "$CF_API_KEY" ]]; }
+}
+
+cf_api() {
+    # cf_api METHOD PATH [JSON_BODY]
+    local method="$1" path="$2" body="${3:-}"
+    local url="https://api.cloudflare.com/client/v4${path}"
+    local -a hdrs=(-H "Content-Type: application/json")
+    if [[ -n "$CF_API_TOKEN" ]]; then
+        hdrs+=(-H "Authorization: Bearer ${CF_API_TOKEN}")
+    else
+        hdrs+=(-H "X-Auth-Email: ${CF_EMAIL}" -H "X-Auth-Key: ${CF_API_KEY}")
+    fi
+    if [[ -n "$body" ]]; then
+        curl -fsS -X "$method" "$url" "${hdrs[@]}" --data "$body"
+    else
+        curl -fsS -X "$method" "$url" "${hdrs[@]}"
+    fi
+}
+
+# Find the Cloudflare zone whose name is the longest suffix of $1.
+# Echoes "<zone_id>|<zone_name>", returns 1 if no match.
+cf_find_zone() {
+    local fqdn="$1"
+    local labels="$fqdn"
+    while [[ "$labels" == *.* ]]; do
+        labels="${labels#*.}"
+        local resp; resp=$(cf_api GET "/zones?name=${labels}" 2>/dev/null) || return 1
+        local zid; zid=$(printf '%s' "$resp" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+r=d.get("result") or []
+print(r[0]["id"] if r else "")' 2>/dev/null)
+        if [[ -n "$zid" ]]; then
+            printf '%s|%s' "$zid" "$labels"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Look up existing record. Echoes "<id>|<content>", empty if none.
+cf_find_record() {
+    local zone_id="$1" rtype="$2" name="$3"
+    cf_api GET "/zones/${zone_id}/dns_records?type=${rtype}&name=${name}" 2>/dev/null \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+r=(d.get("result") or [])
+if r:
+    print("{}|{}".format(r[0]["id"], r[0]["content"]))'
+}
+
+# Idempotent upsert. Returns 0 on no-op or success, 1 on failure.
+cf_ensure_record() {
+    local zone_id="$1" rtype="$2" name="$3" content="$4" ttl="${5:-$CF_RECORD_TTL}"
+    local existing; existing=$(cf_find_record "$zone_id" "$rtype" "$name")
+    local body
+    body=$(printf '{"type":"%s","name":"%s","content":"%s","ttl":%s}' \
+            "$rtype" "$name" "$content" "$ttl")
+    if [[ -z "$existing" ]]; then
+        local resp; resp=$(cf_api POST "/zones/${zone_id}/dns_records" "$body") || return 1
+        info "  + ${rtype} ${name} → ${content}"
+    else
+        local rec_id="${existing%%|*}" cur="${existing#*|}"
+        if [[ "$cur" == "$content" ]]; then
+            info "  = ${rtype} ${name} → ${content} (already correct)"
+        else
+            local resp; resp=$(cf_api PUT "/zones/${zone_id}/dns_records/${rec_id}" "$body") || return 1
+            info "  ~ ${rtype} ${name} → ${content} (was: ${cur})"
+        fi
+    fi
+}
+
+# cf_provision_dns "<server_ip>" "<sub1>" "<sub2>" ...
+cf_provision_dns() {
+    local server_ip="$1"; shift
+    local domains=("$@")
+    section "Cloudflare DNS provisioning"
+    if ! cf_has_creds; then
+        warn "No Cloudflare credentials set. Set CF_API_TOKEN (or CF_EMAIL + CF_API_KEY)."
+        return 1
+    fi
+    if [[ ${#domains[@]} -eq 0 ]]; then
+        warn "No tunnel domains to provision."
+        return 0
+    fi
+    require python3
+    require curl
+
+    # Group subdomains by zone so we only set up each glue record once.
+    declare -A ZONE_BY_APEX=()
+    declare -A SUBS_BY_APEX=()
+    local d zone zid apex
+    for d in "${domains[@]}"; do
+        [[ -z "$d" || "$d" == *example.com ]] && continue
+        zone=$(cf_find_zone "$d") || { warn "  no Cloudflare zone found for $d — skipping"; continue; }
+        zid="${zone%%|*}"; apex="${zone#*|}"
+        ZONE_BY_APEX["$apex"]="$zid"
+        SUBS_BY_APEX["$apex"]+="${d} "
+    done
+
+    if [[ ${#ZONE_BY_APEX[@]} -eq 0 ]]; then
+        warn "No tunnel domains map to a Cloudflare zone on this account."
+        return 1
+    fi
+
+    for apex in "${!ZONE_BY_APEX[@]}"; do
+        zid="${ZONE_BY_APEX[$apex]}"
+        local glue="${CF_NS_GLUE_LABEL}.${apex}"
+        info "Zone ${apex} (${zid})"
+        cf_ensure_record "$zid" "A"  "$glue"  "$server_ip" || warn "  failed to upsert glue ${glue}"
+        for d in ${SUBS_BY_APEX[$apex]}; do
+            [[ "$d" == "$glue" ]] && continue
+            cf_ensure_record "$zid" "NS" "$d" "$glue" || warn "  failed to upsert NS ${d}"
+        done
+    done
+    info "Cloudflare DNS provisioning complete."
+}
+
+# Collects (server_ip, [domains]) from the currently-selected INSTALL_* flags
+# and runs cf_provision_dns. Used by the wizard and standalone mode.
+cf_provision_from_selection() {
+    local selected=()
+    [[ "${INSTALL_MDNS:-0}"     == 1 ]] && selected+=("$MDNS_DOMAIN")
+    [[ "${INSTALL_SLIP:-0}"     == 1 ]] && selected+=("$SLIP_DOMAIN")
+    [[ "${INSTALL_DNSTT:-0}"    == 1 ]] && selected+=("$DNSTT_DOMAIN")
+    [[ "${INSTALL_VAYDNS:-0}"   == 1 ]] && selected+=("$VAYDNS_DOMAIN")
+    [[ "${INSTALL_STORMDNS:-0}" == 1 ]] && selected+=("$STORMDNS_DOMAIN")
+    cf_provision_dns "$SERVER_IP" "${selected[@]}"
+}
+
+# ════════════════════════════════════════════════════════════
 #  DNSTM ROUTER
 # ════════════════════════════════════════════════════════════
 
@@ -1436,6 +1587,33 @@ wizard_collect_inputs() {
     [[ $INSTALL_VAYDNS   == 1 ]] && ask VAYDNS_DOMAIN   "VayDNS domain      " "${VAYDNS_DOMAIN}"
     [[ $INSTALL_STORMDNS == 1 ]] && ask STORMDNS_DOMAIN "StormDNS domain    " "${STORMDNS_DOMAIN}"
 
+    # ── Cloudflare DNS auto-provisioning ──────────────────
+    echo ""
+    echo -e "  ${C_BOLD}── Cloudflare DNS (optional) ──────────────────────${C_RESET}"
+    echo -e "  ${C_DIM}Auto-creates the NS delegation for each tunnel domain.${C_RESET}"
+    echo -e "  ${C_DIM}Pattern: <tunnel-sub> NS ${CF_NS_GLUE_LABEL}.<apex>  +  ${CF_NS_GLUE_LABEL}.<apex> A ${SERVER_IP}${C_RESET}"
+    echo ""
+    local _cf_default="n"
+    cf_has_creds && _cf_default="y"
+    if ask_yn "Provision DNS via Cloudflare API" "$_cf_default"; then
+        CF_PROVISION=1
+        if [[ -z "$CF_API_TOKEN" && ( -z "$CF_EMAIL" || -z "$CF_API_KEY" ) ]]; then
+            echo -e "  ${C_DIM}Prefer a scoped API token (Permissions: Zone:DNS:Edit + Zone:Zone:Read).${C_RESET}"
+            ask_pass CF_API_TOKEN "Cloudflare API token (blank to use global key + email)"
+            if [[ -z "$CF_API_TOKEN" ]]; then
+                ask      CF_EMAIL    "Cloudflare account email" "$CF_EMAIL"
+                ask_pass CF_API_KEY  "Cloudflare global API key"
+            fi
+        fi
+        if ! cf_has_creds; then
+            warn "No Cloudflare credentials provided — skipping DNS auto-provisioning."
+            CF_PROVISION=0
+        fi
+        if [[ "$CF_PROVISION" == 1 ]]; then
+            ask CF_NS_GLUE_LABEL "Shared NS glue label (creates <label>.<apex>)" "$CF_NS_GLUE_LABEL"
+        fi
+    fi
+
     # ── Credentials ───────────────────────────────────────
     echo ""
     echo -e "  ${C_BOLD}── SOCKS5 Authentication ──────────────────────────${C_RESET}"
@@ -1472,6 +1650,11 @@ wizard_collect_inputs() {
     fi
     [[ "${INSTALL_SSH_TUNNEL:-0}" == 1 ]] && printf "  %-22s  %s\n" "SSH tunnel user:" "tunneluser"
     [[ "${INSTALL_SSLH_MUX:-0}" == 1 ]]  && printf "  %-22s  %s\n" "Protocol mux:" "sslh (SSH+SOCKS5 on dnstt)"
+    if [[ "${CF_PROVISION:-0}" == 1 ]]; then
+        local _cf_mode="API token"
+        [[ -z "$CF_API_TOKEN" ]] && _cf_mode="global key + ${CF_EMAIL}"
+        printf "  %-22s  %s\n" "Cloudflare DNS:" "auto (${_cf_mode}, glue=${CF_NS_GLUE_LABEL}.<apex>)"
+    fi
     echo ""
     hr
     echo ""
@@ -1514,6 +1697,8 @@ wizard_run_install() {
 
     # Always set up dnstm router
     setup_dnstm
+
+    [[ "${CF_PROVISION:-0}" == 1 ]] && cf_provision_from_selection
 
     echo ""
     section "Installation Complete"
@@ -1801,6 +1986,30 @@ case "$MODE" in
     status)              show_status ;;
     client-config)       print_client_configs ;;
     middle-proxy)        setup_middle_proxy ;;
+    cloudflare-dns)
+        # Provision Cloudflare NS delegations for tunnel domains.
+        # Usage:
+        #   CF_API_TOKEN=... ./setup.sh cloudflare-dns <sub1> [sub2 ...]
+        #   CF_EMAIL=... CF_API_KEY=... ./setup.sh cloudflare-dns a.foo.com b.foo.com
+        # With no args, falls back to the MDNS/SLIP/DNSTT/VAYDNS/STORMDNS env defaults
+        # (skipping any still set to *.example.com).
+        shift
+        if ! cf_has_creds; then
+            error "Set CF_API_TOKEN (or CF_EMAIL + CF_API_KEY) before running this mode."
+        fi
+        if [[ $# -gt 0 ]]; then
+            cf_provision_dns "$SERVER_IP" "$@"
+        else
+            local _doms=()
+            [[ "$MDNS_DOMAIN"     != *example.com ]] && _doms+=("$MDNS_DOMAIN")
+            [[ "$SLIP_DOMAIN"     != *example.com ]] && _doms+=("$SLIP_DOMAIN")
+            [[ "$DNSTT_DOMAIN"    != *example.com ]] && _doms+=("$DNSTT_DOMAIN")
+            [[ "$VAYDNS_DOMAIN"   != *example.com ]] && _doms+=("$VAYDNS_DOMAIN")
+            [[ "$STORMDNS_DOMAIN" != *example.com ]] && _doms+=("$STORMDNS_DOMAIN")
+            [[ ${#_doms[@]} -eq 0 ]] && error "No domains. Pass them as args or set *_DOMAIN env vars."
+            cf_provision_dns "$SERVER_IP" "${_doms[@]}"
+        fi
+        ;;
     *)
         echo ""
         echo "  DNS Tunnel Kit — Credits: github.com/mrvcoder"
@@ -1819,8 +2028,10 @@ case "$MODE" in
         printf "    %-18s  %s\n" "status"         "Show service status"
         printf "    %-18s  %s\n" "client-config"  "Print all client configs"
         printf "    %-18s  %s\n" "middle-proxy"   "Iranian VPS DNS multiplexer"
+        printf "    %-18s  %s\n" "cloudflare-dns" "Provision NS delegations on Cloudflare"
         echo ""
         echo "  Env overrides: TUNNEL_USER, TUNNEL_PASS, MDNS_DOMAIN, SLIP_DOMAIN, DNSTT_DOMAIN, VAYDNS_DOMAIN, STORMDNS_DOMAIN"
+        echo "  Cloudflare:    CF_API_TOKEN  (or CF_EMAIL + CF_API_KEY), CF_NS_GLUE_LABEL (default 'dns'), CF_RECORD_TTL (default 60)"
         echo ""
         ;;
 esac

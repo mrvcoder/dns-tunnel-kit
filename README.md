@@ -60,7 +60,7 @@ All five run simultaneously on the same server, each on a different subdomain.
 ### Full Server Setup
 
 ```bash
-git clone https://github.com/BarzinJarvis/dns-tunnel-kit
+git clone https://github.com/mrvcoder/dns-tunnel-kit
 cd dns-tunnel-kit
 
 # Install everything: MasterDnsVPN + Slipstream + dnstt + VayDNS + StormDNS + dnstm router
@@ -177,7 +177,7 @@ LOG_LEVEL     = "INFO"
 
 ### 🟢 Slipstream (`b.yourdomain.com`)
 
-Use [SlipNet Android app](https://github.com/BarzinJarvis/SlipNet) with profile:
+Use [SlipNet Android app](https://github.com/mrvcoder/SlipNet) with profile:
 
 | Setting | Value |
 |---|---|
@@ -213,7 +213,7 @@ Compatible clients: `dnstt-client`, NoizDNS client, SlipNet (NoizDNS profile typ
 
 VayDNS is a modern DNS tunnel using **Noise protocol encryption** + **KCP/smux transport** + **uTLS fingerprinting** (Chrome 120 by default). It provides better performance and obfuscation than standard dnstt.
 
-Compatible clients: [SlipNet Android app](https://github.com/BarzinJarvis/SlipNet) (VayDNS profile), `vaydns-client` CLI.
+Compatible clients: [SlipNet Android app](https://github.com/mrvcoder/SlipNet) (VayDNS profile), `vaydns-client` CLI.
 
 1. Get pubkey from server:
 ```bash
@@ -231,7 +231,7 @@ cat /opt/vaydns/server.pub
 3. **CLI client** (Linux x86_64 or ARM64):
 ```bash
 # Download pre-built binary (Linux x86_64)
-curl -L https://github.com/BarzinJarvis/dns-tunnel-kit/releases/latest/download/vaydns-client-linux-amd64 \
+curl -L https://github.com/mrvcoder/dns-tunnel-kit/releases/latest/download/vaydns-client-linux-amd64 \
   -o vaydns-client && chmod +x vaydns-client
 
 ./vaydns-client \

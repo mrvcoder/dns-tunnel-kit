@@ -259,153 +259,158 @@ make_slipnet_uri() {
     printf 'slipnet://%s\n' "$(printf '%s' "${f[*]}" | base64 -w0)"
 }
 
-install_bundled_binaries() {
-    section "Installing bundled binaries"
-    local ARCH; ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-    local script_dir
+# Order of preference for every binary:
+#   1. Already installed on $PATH → leave alone.
+#   2. Try the upstream GitHub releases URL (latest). If that succeeds and
+#      the file is a real ELF, install it.
+#   3. Fall back to the kit's vendored bin/<name> snapshot.
+#   4. Otherwise warn and continue (caller decides whether to bail).
+# Set FORCE_BUNDLED=1 to skip step 2 entirely (offline / pinned mode).
+
+# try_fetch_binary <url> <dest_path>  →  returns 0 on success, non-zero on fail.
+try_fetch_binary() {
+    local url="$1" dest="$2"
+    [[ "${FORCE_BUNDLED:-0}" == 1 ]] && return 1
+    local tmp; tmp=$(mktemp)
+    if curl -fsSL --connect-timeout 8 --max-time 60 -o "$tmp" "$url" 2>/dev/null \
+        && [[ -s "$tmp" ]] && file "$tmp" 2>/dev/null | grep -q ELF; then
+        install -m 0755 "$tmp" "$dest"
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# install_from_bundle <bin_name> <dest_path>  →  returns 0 on success.
+install_from_bundle() {
+    local name="$1" dest="$2"
+    local script_dir bundle
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local bin_dir="${script_dir}/bin"
-
-    # dnstm — try local bin/ first, then download from GitHub releases
-    if [[ -f "${bin_dir}/dnstm" ]]; then
-        install -m 0755 "${bin_dir}/dnstm" "/usr/local/bin/dnstm"
-        info "Installed: dnstm (bundled)"
-    elif ! command -v dnstm >/dev/null 2>&1; then
-        info "Downloading dnstm..."
-        local dnstm_url="https://github.com/net2share/dnstm/releases/latest/download/dnstm-linux-${ARCH}"
-        if curl -fSL -o /tmp/dnstm "${dnstm_url}" 2>/dev/null; then
-            install -m 0755 /tmp/dnstm /usr/local/bin/dnstm
-            rm -f /tmp/dnstm
-            info "Installed: dnstm"
-        else
-            warn "Failed to download dnstm"
-        fi
-    else
-        info "dnstm already installed: $(dnstm version 2>/dev/null || echo ok)"
+    bundle="${script_dir}/bin/${name}"
+    if [[ -f "$bundle" ]]; then
+        install -m 0755 "$bundle" "$dest"
+        return 0
     fi
+    return 1
+}
 
-    # microsocks — try local bin/ first, then build from source or download
-    if [[ -f "${bin_dir}/microsocks" ]]; then
-        install -m 0755 "${bin_dir}/microsocks" "/usr/local/bin/microsocks"
-        info "Installed: microsocks (bundled)"
-    elif ! command -v microsocks >/dev/null 2>&1; then
-        info "Downloading microsocks..."
-        local msocks_url="https://github.com/rofl0r/microsocks/releases/latest/download/microsocks-linux-${ARCH}"
-        if curl -fSL -o /tmp/microsocks "${msocks_url}" 2>/dev/null && file /tmp/microsocks | grep -q ELF; then
-            install -m 0755 /tmp/microsocks /usr/local/bin/microsocks
-            rm -f /tmp/microsocks
-            info "Installed: microsocks"
-        else
-            # Build from source as fallback
-            rm -f /tmp/microsocks
-            info "Building microsocks from source..."
-            apt-get install -y gcc make git 2>/dev/null | tail -1
-            git clone --depth=1 https://github.com/rofl0r/microsocks /tmp/microsocks-src 2>/dev/null
-            make -C /tmp/microsocks-src 2>/dev/null
+# ensure_binary <pretty_name> <bin_name> <dest_path> <upstream_url>
+# Tries: already-on-PATH → upstream → bundled. Warns on total failure.
+ensure_binary() {
+    local pretty="$1" name="$2" dest="$3" url="$4"
+    if [[ -x "$dest" ]] || command -v "$name" >/dev/null 2>&1; then
+        info "${pretty} already installed"
+        return 0
+    fi
+    info "Fetching ${pretty} from upstream..."
+    if try_fetch_binary "$url" "$dest"; then
+        info "Installed: ${pretty} (upstream)"
+        return 0
+    fi
+    if install_from_bundle "$name" "$dest"; then
+        info "Installed: ${pretty} (bundled fallback)"
+        return 0
+    fi
+    warn "${pretty}: upstream fetch failed and no bundled fallback available"
+    return 1
+}
+
+install_bundled_binaries() {
+    section "Installing binaries (upstream first, bundled fallback)"
+    local ARCH; ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+
+    ensure_binary "dnstm"             "dnstm"             "/usr/local/bin/dnstm" \
+        "https://github.com/net2share/dnstm/releases/latest/download/dnstm-linux-${ARCH}"
+
+    # microsocks: same flow, but on total failure try building from source.
+    if ! ensure_binary "microsocks"   "microsocks"        "/usr/local/bin/microsocks" \
+            "https://github.com/rofl0r/microsocks/releases/latest/download/microsocks-linux-${ARCH}"; then
+        info "Building microsocks from source as last-resort..."
+        apt-get install -y gcc make git 2>/dev/null | tail -1
+        if git clone --depth=1 https://github.com/rofl0r/microsocks /tmp/microsocks-src 2>/dev/null \
+                && make -C /tmp/microsocks-src 2>/dev/null \
+                && [[ -x /tmp/microsocks-src/microsocks ]]; then
             install -m 0755 /tmp/microsocks-src/microsocks /usr/local/bin/microsocks
-            rm -rf /tmp/microsocks-src
             info "Installed: microsocks (built from source)"
-        fi
-    else
-        info "microsocks already installed"
-    fi
-
-    # slipstream-server — try local bin/ first, then download
-    if [[ -f "${bin_dir}/slipstream-server" ]]; then
-        install -m 0755 "${bin_dir}/slipstream-server" "/usr/local/bin/slipstream-server"
-        info "Installed: slipstream-server (bundled)"
-    elif ! command -v slipstream-server >/dev/null 2>&1; then
-        info "Downloading slipstream-server..."
-        local slip_url="https://github.com/endpositive/slipstream/releases/latest/download/slipstream-server-linux-${ARCH}"
-        if curl -fSL -o /tmp/slipstream-server "${slip_url}" 2>/dev/null && file /tmp/slipstream-server | grep -q ELF; then
-            install -m 0755 /tmp/slipstream-server /usr/local/bin/slipstream-server
-            rm -f /tmp/slipstream-server
-            info "Installed: slipstream-server"
         else
-            warn "Failed to download slipstream-server — please install manually"
+            warn "microsocks source build failed"
         fi
-    else
-        info "slipstream-server already installed"
+        rm -rf /tmp/microsocks-src
     fi
 
-    # vaydns-server — bundled in bin/ or downloadable
-    if [[ -f "${bin_dir}/vaydns-server" ]]; then
-        install -m 0755 "${bin_dir}/vaydns-server" "/usr/local/bin/vaydns-server"
-        info "Installed: vaydns-server (bundled)"
-    elif ! command -v vaydns-server >/dev/null 2>&1; then
-        info "Downloading vaydns-server..."
-        local vaydns_url="https://github.com/net2share/vaydns/releases/latest/download/vaydns-server-linux-${ARCH}"
-        if curl -fSL -o /tmp/vaydns-server "${vaydns_url}" 2>/dev/null && file /tmp/vaydns-server | grep -q ELF; then
-            install -m 0755 /tmp/vaydns-server /usr/local/bin/vaydns-server
-            rm -f /tmp/vaydns-server
-            info "Installed: vaydns-server"
-        else
-            warn "Failed to download vaydns-server — VayDNS setup will be skipped"
-        fi
-    else
-        info "vaydns-server already installed"
-    fi
+    ensure_binary "slipstream-server" "slipstream-server" "/usr/local/bin/slipstream-server" \
+        "https://github.com/endpositive/slipstream/releases/latest/download/slipstream-server-linux-${ARCH}"
 
-    # NoizDNS dnstt-server (supports both dnstt + NoizDNS clients).
-    # The upstream release URL was historically flaky / 404, so we
-    # fall back to the bundled bin/dnstt-server (issue #1).
-    if ! command -v dnstt-server-noizdns >/dev/null 2>&1; then
-        info "Installing dnstt-server-noizdns..."
+    ensure_binary "vaydns-server"     "vaydns-server"     "/usr/local/bin/vaydns-server" \
+        "https://github.com/net2share/vaydns/releases/latest/download/vaydns-server-linux-${ARCH}"
+
+    # dnstt-server-noizdns: bundled snapshot is named bin/dnstt-server (legacy).
+    if [[ ! -x /usr/local/bin/dnstt-server-noizdns ]] && ! command -v dnstt-server-noizdns >/dev/null 2>&1; then
+        info "Fetching dnstt-server-noizdns from upstream..."
         local noizdns_url="https://github.com/anonvector/noizdns-deploy/releases/latest/download/dnstt-server-linux-${ARCH}"
-        if curl -fSL -o /tmp/dnstt-server-noizdns "${noizdns_url}" 2>/dev/null \
-                && file /tmp/dnstt-server-noizdns | grep -q ELF; then
-            install -m 0755 /tmp/dnstt-server-noizdns /usr/local/bin/dnstt-server-noizdns
-            rm -f /tmp/dnstt-server-noizdns
+        if try_fetch_binary "$noizdns_url" /usr/local/bin/dnstt-server-noizdns; then
             info "Installed: dnstt-server-noizdns (upstream)"
+        elif install_from_bundle "dnstt-server" /usr/local/bin/dnstt-server-noizdns; then
+            info "Installed: dnstt-server-noizdns (bundled fallback: bin/dnstt-server)"
+        elif command -v dnstt-server >/dev/null 2>&1; then
+            ln -sf "$(command -v dnstt-server)" /usr/local/bin/dnstt-server-noizdns
+            info "Installed: dnstt-server-noizdns (symlink to existing dnstt-server)"
         else
-            rm -f /tmp/dnstt-server-noizdns
-            if [[ -f "${bin_dir}/dnstt-server" ]]; then
-                install -m 0755 "${bin_dir}/dnstt-server" /usr/local/bin/dnstt-server-noizdns
-                info "Installed: dnstt-server-noizdns (from bundled bin/dnstt-server)"
-            elif command -v dnstt-server >/dev/null 2>&1; then
-                ln -sf "$(command -v dnstt-server)" /usr/local/bin/dnstt-server-noizdns
-                info "Installed: dnstt-server-noizdns (symlink to dnstt-server)"
-            else
-                warn "Failed to install dnstt-server-noizdns"
-            fi
+            warn "dnstt-server-noizdns: upstream + bundled both unavailable"
         fi
     else
         info "dnstt-server-noizdns already installed"
     fi
 
-    # StormDNS — released as a zipped per-arch binary on GitHub.
-    if [[ ! -x "${STORMDNS_INSTALL_DIR}/stormdns-server" ]]; then
-        local sd_arch sd_prefix
-        case "$ARCH" in
-            amd64) sd_arch="AMD64" ;;
-            arm64) sd_arch="ARM64" ;;
-            *)     sd_arch=""      ;;
-        esac
-        if [[ -n "$sd_arch" ]]; then
-            info "Downloading StormDNS server..."
-            sd_prefix="StormDNS_Server_Linux_${sd_arch}"
-            local sd_url="https://github.com/nullroute1970/StormDNS/releases/latest/download/${sd_prefix}.zip"
-            if curl -fSL -o /tmp/stormdns.zip "${sd_url}" 2>/dev/null; then
-                mkdir -p "${STORMDNS_INSTALL_DIR}"
-                unzip -oq /tmp/stormdns.zip -d /tmp/stormdns-extract
-                local sd_bin
-                sd_bin=$(find /tmp/stormdns-extract -maxdepth 2 -type f -name "${sd_prefix}*" 2>/dev/null | head -n1)
-                if [[ -n "$sd_bin" ]]; then
-                    install -m 0755 "$sd_bin" "${STORMDNS_INSTALL_DIR}/stormdns-server"
-                    info "Installed: stormdns-server → ${STORMDNS_INSTALL_DIR}/"
-                else
-                    warn "StormDNS binary not found inside ${sd_prefix}.zip"
-                fi
-                rm -rf /tmp/stormdns.zip /tmp/stormdns-extract
-            else
-                warn "Failed to download StormDNS — install will be skipped"
-            fi
-        else
-            warn "StormDNS: unsupported arch '${ARCH}' (only amd64/arm64 published)"
-        fi
-    else
+    # StormDNS: zipped per-arch upstream, optional bundled bin/stormdns-server.
+    install_stormdns_binary "$ARCH"
+}
+
+install_stormdns_binary() {
+    local ARCH="$1"
+    if [[ -x "${STORMDNS_INSTALL_DIR}/stormdns-server" ]]; then
         info "stormdns-server already installed"
+        return 0
     fi
+    mkdir -p "${STORMDNS_INSTALL_DIR}"
+    local sd_arch
+    case "$ARCH" in
+        amd64) sd_arch="AMD64" ;;
+        arm64) sd_arch="ARM64" ;;
+        *)     sd_arch=""      ;;
+    esac
+
+    if [[ "${FORCE_BUNDLED:-0}" != 1 && -n "$sd_arch" ]]; then
+        info "Fetching StormDNS server from upstream..."
+        local sd_prefix="StormDNS_Server_Linux_${sd_arch}"
+        local sd_url="https://github.com/nullroute1970/StormDNS/releases/latest/download/${sd_prefix}.zip"
+        if curl -fsSL --connect-timeout 8 --max-time 90 -o /tmp/stormdns.zip "$sd_url" 2>/dev/null; then
+            unzip -oq /tmp/stormdns.zip -d /tmp/stormdns-extract 2>/dev/null
+            local sd_bin
+            sd_bin=$(find /tmp/stormdns-extract -maxdepth 2 -type f -name "${sd_prefix}*" 2>/dev/null | head -n1)
+            if [[ -n "$sd_bin" ]] && file "$sd_bin" 2>/dev/null | grep -q ELF; then
+                install -m 0755 "$sd_bin" "${STORMDNS_INSTALL_DIR}/stormdns-server"
+                rm -rf /tmp/stormdns.zip /tmp/stormdns-extract
+                info "Installed: stormdns-server (upstream) → ${STORMDNS_INSTALL_DIR}/"
+                return 0
+            fi
+            rm -rf /tmp/stormdns.zip /tmp/stormdns-extract
+            warn "StormDNS upstream zip missing expected binary — trying bundled fallback"
+        else
+            warn "StormDNS upstream download failed — trying bundled fallback"
+        fi
+    elif [[ -z "$sd_arch" ]]; then
+        warn "StormDNS: unsupported arch '${ARCH}' (only amd64/arm64 published) — trying bundled fallback"
+    fi
+
+    # Bundled fallback (optional — only used if someone vendors bin/stormdns-server).
+    if install_from_bundle "stormdns-server" "${STORMDNS_INSTALL_DIR}/stormdns-server"; then
+        info "Installed: stormdns-server (bundled fallback) → ${STORMDNS_INSTALL_DIR}/"
+        return 0
+    fi
+    warn "stormdns-server: upstream + bundled both unavailable, StormDNS install will be skipped"
+    return 1
 }
 
 # ════════════════════════════════════════════════════════════

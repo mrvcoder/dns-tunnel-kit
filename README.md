@@ -33,25 +33,34 @@ All five run simultaneously on the same server, each on a different subdomain.
 
 ---
 
-## 📦 Included Binaries (`bin/`)
+## 📦 Binary install policy
 
-| Binary | Purpose |
-|---|---|
-| `dnstm` | DNS traffic multiplexer — routes per-domain to the right tunnel |
-| `slipstream-server` | Slipstream DNS tunnel server |
-| `dnstt-server` | dnstt DNS tunnel server (bundled, standard) |
-| `dnstt-server-noizdns` | NoizDNS-compatible dnstt server (auto-detects dnstt + NoizDNS clients) |
-| `microsocks` | Lightweight SOCKS5 server (all tunnel backends) |
-| `vaydns-server` | VayDNS server — Noise-encrypted DNS tunnel with KCP/smux transport |
+`setup.sh` resolves every binary in this order:
 
-> **MasterDnsVPN** is not bundled — `setup.sh` downloads the latest release automatically from  
-> [github.com/masterking32/MasterDnsVPN/releases](https://github.com/masterking32/MasterDnsVPN/releases/latest)
+1. **Already on `$PATH`** — leave it alone.
+2. **Latest GitHub release** — try the upstream `releases/latest/download/...` URL and verify the file is a real ELF.
+3. **Vendored `bin/<name>`** — fall back to the snapshot shipped in this repo.
+4. Warn and continue (the per-tunnel setup decides whether to abort).
 
-> **dnstt-server-noizdns** is not bundled — `setup.sh` downloads it automatically from  
-> [github.com/anonvector/noizdns-deploy/releases](https://github.com/anonvector/noizdns-deploy/releases/latest)
+That way users always pick up upstream fixes by default, but the kit still works offline / behind a firewall using the pinned `bin/` snapshot.
 
-> **StormDNS** is not bundled — `setup.sh` downloads the latest release automatically from  
-> [github.com/nullroute1970/StormDNS/releases](https://github.com/nullroute1970/StormDNS/releases/latest)
+| Binary | Vendored fallback (`bin/`) | Upstream source |
+|---|---|---|
+| `dnstm` | ✅ | [github.com/net2share/dnstm](https://github.com/net2share/dnstm/releases/latest) |
+| `slipstream-server` | ✅ | [github.com/endpositive/slipstream](https://github.com/endpositive/slipstream/releases/latest) |
+| `dnstt-server` | ✅ (also used as the fallback for `dnstt-server-noizdns`) | upstream of NoizDNS variant: [github.com/anonvector/noizdns-deploy](https://github.com/anonvector/noizdns-deploy/releases/latest) |
+| `microsocks` | ✅ (and source-build is a last resort) | [github.com/rofl0r/microsocks](https://github.com/rofl0r/microsocks/releases/latest) |
+| `vaydns-server` | ✅ | [github.com/net2share/vaydns](https://github.com/net2share/vaydns/releases/latest) |
+| `stormdns-server` | optional (drop a binary at `bin/stormdns-server` to enable offline install) | [github.com/nullroute1970/StormDNS](https://github.com/nullroute1970/StormDNS/releases/latest) |
+
+> **MasterDnsVPN** is downloaded separately by `setup.sh` (legacy and modern variants) from  
+> [github.com/masterking32/MasterDnsVPN/releases](https://github.com/masterking32/MasterDnsVPN/releases/latest).
+
+Set `FORCE_BUNDLED=1` to skip the upstream check and install straight from `bin/` — useful when you want reproducible builds or your server can't reach GitHub.
+
+```bash
+sudo FORCE_BUNDLED=1 bash setup.sh install
+```
 
 ---
 

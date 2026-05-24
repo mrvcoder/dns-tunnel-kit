@@ -145,13 +145,12 @@ draw_banner() {
     clear
     echo -e "${C_CYAN}${C_BOLD}"
     cat << 'BANNER'
-  ╔══════════════════════════════════════════════════════╗
-  ║          DNS TUNNEL KIT  —  Setup & Manager          ║
-  ║   MasterDnsVPN  ·  Slipstream  ·  dnstt  ·  VayDNS  ║
-  ║   Credits: github.com/mrvcoder                        ║
-  ╚══════════════════════════════════════════════════════╝
+  ╔════════════════════════════════════════════════════════════╗
+  ║              DNS TUNNEL KIT  —  Setup & Manager            ║
+  ║   MasterDnsVPN · Slipstream · dnstt · VayDNS · StormDNS    ║
+  ╚════════════════════════════════════════════════════════════╝
 BANNER
-    echo -e "${C_RESET}"
+    echo -e "${C_RESET}${C_DIM}  Credit: ${C_RESET}${C_WHITE}mrvcoder${C_RESET}${C_DIM}  ·  ${C_RESET}${C_CYAN}https://github.com/mrvcoder${C_RESET}\n"
 }
 
 press_enter() {
@@ -1703,6 +1702,15 @@ wizard_run_install() {
     echo ""
     section "Installation Complete"
     print_client_configs
+    print_credits
+}
+
+print_credits() {
+    echo ""
+    hr
+    echo -e "  ${C_DIM}Built on the work of${C_RESET} ${C_WHITE}${C_BOLD}mrvcoder${C_RESET}  ${C_CYAN}https://github.com/mrvcoder${C_RESET}"
+    hr
+    echo ""
 }
 
 # ════════════════════════════════════════════════════════════
@@ -1977,14 +1985,14 @@ MODE="${1:-menu}"
 case "$MODE" in
     menu)                main_menu ;;
     install)             wizard_collect_inputs; wizard_run_install ;;
-    masterdnsvpn)        install_deps; cleanup_legacy_services; setup_masterdnsvpn; print_client_configs ;;
-    slipstream)          install_deps; install_bundled_binaries; cleanup_legacy_services; setup_slipstream ;;
-    dnstt)               install_deps; install_bundled_binaries; cleanup_legacy_services; setup_dnstt; print_client_configs ;;
-    vaydns)              install_deps; install_bundled_binaries; cleanup_legacy_services; setup_vaydns; print_client_configs ;;
-    stormdns)            install_deps; install_bundled_binaries; cleanup_legacy_services; setup_stormdns; print_client_configs ;;
-    dnstm)               install_deps; install_bundled_binaries; cleanup_legacy_services; setup_dnstm ;;
+    masterdnsvpn)        install_deps; cleanup_legacy_services; setup_masterdnsvpn; print_client_configs; print_credits ;;
+    slipstream)          install_deps; install_bundled_binaries; cleanup_legacy_services; setup_slipstream; print_credits ;;
+    dnstt)               install_deps; install_bundled_binaries; cleanup_legacy_services; setup_dnstt; print_client_configs; print_credits ;;
+    vaydns)              install_deps; install_bundled_binaries; cleanup_legacy_services; setup_vaydns; print_client_configs; print_credits ;;
+    stormdns)            install_deps; install_bundled_binaries; cleanup_legacy_services; setup_stormdns; print_client_configs; print_credits ;;
+    dnstm)               install_deps; install_bundled_binaries; cleanup_legacy_services; setup_dnstm; print_credits ;;
     status)              show_status ;;
-    client-config)       print_client_configs ;;
+    client-config)       print_client_configs; print_credits ;;
     middle-proxy)        setup_middle_proxy ;;
     cloudflare-dns)
         # Provision Cloudflare NS delegations for tunnel domains.
@@ -2012,7 +2020,8 @@ case "$MODE" in
         ;;
     *)
         echo ""
-        echo "  DNS Tunnel Kit — Credits: github.com/mrvcoder"
+        echo "  DNS Tunnel Kit"
+        echo "  Credit: mrvcoder  ·  https://github.com/mrvcoder"
         echo ""
         echo "  Usage:  $0 [mode]"
         echo "  No mode → interactive menu"

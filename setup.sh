@@ -1376,7 +1376,48 @@ show_status() {
 #  CLIENT CONFIGS
 # ════════════════════════════════════════════════════════════
 
+# Read the actual deployed tunnel domains from the dnstm router config so
+# `setup.sh client-config` (called outside the wizard) shows real values
+# instead of the a/b/c/d/e.example.com defaults.
+# Only overrides each *_DOMAIN var when the tag is present in the config
+# AND the var is still its example.com default — explicit overrides win.
+load_active_domains() {
+    [[ ! -f "$DNSTM_CONFIG" ]] && return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local kv; kv=$(python3 - "$DNSTM_CONFIG" <<'PY' 2>/dev/null
+import json, sys
+TAG_TO_VAR = {
+    "mdns-forward":   "MDNS_DOMAIN",
+    "slip-socks":     "SLIP_DOMAIN",
+    "dnstt-tunnel":   "DNSTT_DOMAIN",
+    "vaydns-tunnel":  "VAYDNS_DOMAIN",
+    "stormdns-tunnel":"STORMDNS_DOMAIN",
+}
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+for t in cfg.get("tunnels", []):
+    var = TAG_TO_VAR.get(t.get("tag", ""))
+    dom = t.get("domain", "").strip()
+    if var and dom:
+        print(f"{var}={dom}")
+PY
+)
+    local line var val
+    while IFS='=' read -r var val; do
+        [[ -z "$var" ]] && continue
+        # Only override if user hasn't supplied a real domain.
+        local cur="${!var:-}"
+        if [[ -z "$cur" || "$cur" == *example.com ]]; then
+            printf -v "$var" '%s' "$val"
+        fi
+    done <<< "$kv"
+}
+
 print_client_configs() {
+    load_active_domains
     section "Client Configurations"
 
     local mdns_key
@@ -2013,6 +2054,7 @@ case "$MODE" in
         if [[ $# -gt 0 ]]; then
             cf_provision_dns "$SERVER_IP" "$@"
         else
+            load_active_domains
             local _doms=()
             [[ "$MDNS_DOMAIN"     != *example.com ]] && _doms+=("$MDNS_DOMAIN")
             [[ "$SLIP_DOMAIN"     != *example.com ]] && _doms+=("$SLIP_DOMAIN")
